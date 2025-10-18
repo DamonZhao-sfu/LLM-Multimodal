@@ -38,30 +38,68 @@ class LLM(abc.ABC):
 
 
 def get_tokenizer():
-    #return AutoTokenizer.from_pretrained("meta-llama/Llama-3.1-8B-Instruct")
-    return AutoTokenizer.from_pretrained("/home/haikai/LLM-SQL/llama-tokenizer")
+    return AutoTokenizer.from_pretrained("/scratch/hpc-prf-haqc/haikai/LLM-Multimodal/llama-tokenizer")
+    #return AutoTokenizer.from_pretrained("/home/haikai/LLM-SQL/llama-tokenizer")
     #return AutoTokenizer.from_pretrained("/home/haikai/llama-tokenizer")
 
 def post_http_request(
     model: str,
     prompts: List[str],
     temperature: float = 1.0,
-    api_url: str = "http://localhost:8000/v1/completions",
+    api_url: str = "http://localhost:8000/v1/chat/completions",
     guided_choice: List[str] = None,
+    image_urls: List[str] = None,
 ) -> requests.Response:
+    """
+    Send POST request to chat completions endpoint.
+    
+    Args:
+        model: Model name/identifier
+        prompts: List of text prompts
+        temperature: Sampling temperature
+        api_url: API endpoint URL
+        guided_choice: Optional guided choices
+        image_urls: Optional list of image URLs (one per prompt, or None for text-only)
+    """
+    # Construct messages for each prompt
+    messages_list = []
+    
+    for i, prompt in enumerate(prompts):
+        content = []
+        
+        # Add text content
+        content.append({
+            "type": "text",
+            "text": prompt
+        })
+        
+        # Add image if provided
+        if image_urls and i < len(image_urls) and image_urls[i]:
+            content.append({
+                "type": "image_url",
+                "image_url": {
+                    "url": image_urls[i]
+                }
+            })
+        
+        messages_list.append({
+            "role": "user",
+            "content": content
+        })
+    
     # Construct the payload
     pload = {
         "model": model,
-        "prompt": prompts,
+        "messages": messages_list,
         "temperature": temperature,
     }
+    
     if guided_choice:
         pload["guided_choice"] = guided_choice
 
     headers = {"Content-Type": "application/json"}
 
     req = requests.Request('POST', api_url, headers=headers, data=json.dumps(pload))
-
     prepared = req.prepare()
 
     with requests.Session() as session:
@@ -92,7 +130,7 @@ async def async_post_http_request(
         response_text = await response.text()
         return json.loads(response_text)
 
-def is_server_running(url="http://localhost:8002/v1/models"):
+def is_server_running(url="http://localhost:8000/v1/models"):
     try:
         response = requests.get(url)
         if response.status_code == 200:

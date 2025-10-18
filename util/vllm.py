@@ -15,7 +15,7 @@ class vLLM(LLM):
     def __init__(self, engine_args: EngineArgs, sampling_params: Optional[SamplingParams] = None, base_url: Optional[str] = None):
         self.base_url = None
         if base_url:
-            model = is_server_running("http://localhost:8002/v1/models")
+            model = is_server_running("http://localhost:8000/v1/models")
             if model:
                 self.base_url = base_url
                 self.model = model
@@ -117,57 +117,39 @@ class vLLM(LLM):
         user_prompts = [user_prompt_template.replace("{{fields_json}}", fields_json) for fields_json in fields_json_list]
 
         prompts = [self._generate_prompt(user_prompt=user_prompt, system_prompt=system_prompt) for user_prompt in user_prompts]
-        
+        print("len of prompts"+ len(prompts))
         if self.base_url:
             request_outputs = json.loads(post_http_request(self.model, prompts, temperature=0, api_url=(self.base_url + "/completions"), guided_choice=guided_choice).content)
-            return [choice['text'] for choice in request_outputs['choices']]
+            print(request_outputs)
+            return [choice['message']['content'] for choice in request_outputs['choices']]
         else:
             request_outputs = self.engine.generate(prompts=prompts, sampling_params=self.sampling_params)
             return [output for output in request_outputs]
 
-    def batchQuery(model: LLM, 
-          prompt: str, 
-          df: DataFrame, 
-          system_prompt: str = DEFAULT_SYSTEM_PROMPT,
-          ):
-    
-        # Returns a list of dicts, maintaining column order.
-        records = df.to_dict(orient="records")
-        
-        outputs = model.execute_batch_v2(
-            fields=records,
-            query=prompt,
-            system_prompt=system_prompt
-            #guided_choice=["Yes","No"]
-        )
-        return outputs
-
     def execute_batch_v2(self, fields: List[Dict[str, str]], query: str, system_prompt: str = DEFAULT_SYSTEM_PROMPT, guided_choice: List[str] = None) -> List[str]:        
-       
-        
-        # Now, serialize the processed dictionaries into JSON strings
-        fields_json_list = [json.dumps(processed_field) for processed_field in fields]
-        
-        # Define the prompt template
-        user_prompt_template = query + "Given the following data:\n {{fields_json}} \n answer the above query:\n"
-        
-        # Create the final list of user prompts by substituting the JSON strings
+        fields_json_list = [json.dumps(field) for field in fields]
+        user_prompt_template = "Given the following data:\n {{fields_json}} \n answer the below query:\n"
+        user_prompt_template += query
+
         user_prompts = [user_prompt_template.replace("{{fields_json}}", fields_json) for fields_json in fields_json_list]
-        
         prompts = [self._generate_prompt(user_prompt=user_prompt, system_prompt=system_prompt) for user_prompt in user_prompts]
-        print("prompt:" , prompts[0])
-        request_outputs = json.loads(post_http_request(self.model, prompts, temperature=0, api_url=(self.base_url + "/completions"), guided_choice=guided_choice).content)
-
-
-        input_token_length = request_outputs["usage"]["prompt_tokens"]
-        output_token_length = request_outputs["usage"]["completion_tokens"]
-        total_tokens = request_outputs["usage"]["total_tokens"]
-
-        # print(f"Input tokens: {input_token_length}")
-        # print(f"Output tokens: {output_token_length}")
-        # print(f"Total tokens: {total_tokens}")
-
-        return [choice['text'] for choice in request_outputs['choices']]
+        print("len of prompts" + str(len(prompts)))
+        outputs = []
+        if self.base_url:
+            # For each prompt, send a separate HTTP POST request and collect its answer.
+            for prompt in prompts:
+                response = post_http_request(self.model, [prompt], temperature=0, api_url=(self.base_url + "/completions"), guided_choice=guided_choice)
+                request_output = json.loads(response.content)
+                # Pick the corresponding answer out of the returned choices
+                choices = request_output.get('choices', [])
+                if choices and 'message' in choices[0] and 'content' in choices[0]['message']:
+                    outputs.append(choices[0]['message']['content'])
+                else:
+                    outputs.append(None)  # or append "" or raise Exception, depending on error handling desired
+            return outputs
+        else:
+            request_outputs = self.engine.generate(prompts=prompts, sampling_params=self.sampling_params)
+            return [output for output in request_outputs]
 
         
 

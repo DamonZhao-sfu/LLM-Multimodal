@@ -25,15 +25,15 @@ spark = SparkSession.builder \
     .getOrCreate()
 spark.conf.set("spark.sql.execution.arrow.maxRecordsPerBatch", 50000)
 
-algo_config = "quick_greedy"
+# algo_config = "quick_greedy"
 
-base_path = os.path.dirname(os.path.abspath(__file__))
-solver_config_path = dataset_config_path = os.path.join(base_path, "solver_configs", f"{algo_config}.yaml")
-solver_config = read_yaml(solver_config_path)
-algo = solver_config["algorithm"]
-merged_cols = [] if not solver_config.get("colmerging", True) else data_config["merged_columns"]
-one_deps = []
-default_distinct_value_threshold = 0.0
+# base_path = os.path.dirname(os.path.abspath(__file__))
+# solver_config_path = dataset_config_path = os.path.join(base_path, "solver_configs", f"{algo_config}.yaml")
+# solver_config = read_yaml(solver_config_path)
+# algo = solver_config["algorithm"]
+# merged_cols = [] if not solver_config.get("colmerging", True) else data_config["merged_columns"]
+# one_deps = []
+# default_distinct_value_threshold = 0.0
 
 
 
@@ -173,14 +173,9 @@ register_llm_udf()
 
 """
 queries = [
-# {
-#     "name": "products",
-#     "sql": ("SELECT LLM('Given the following fields related to amazon products {text},{description},{parent_asin},{review_title},{verified_purchase},{rating},{product_title},{id}, summarize the product, then answer whether the product description is consistent with the quality expressed in the review.', products.text, products.description, products.parent_asin, products.review_title, products.verified_purchase, products.rating, products.product_title, products.id) from products")
-# },
-{
+
     "name": "movies",
     "sql": ("SELECT LLM('Given information including movie descriptions and a critic reviews for movies with a positive sentiment, summarize the good qualities in this movie that led to a favorable rating. {reviewcontent},{topcritic},{movieinfo},{movietitle},{genres}', movies.reviewcontent, movies.topcritic, movies.movieinfo, movies.movietitle,movies.genres) from movies")
-}
 ]
 # List to store execution times
 execution_times = []
