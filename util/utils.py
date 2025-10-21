@@ -225,3 +225,181 @@ def read_yaml(yaml_path):
     with open(yaml_path, "r") as file:
         data = yaml.safe_load(file)
     return data
+
+
+
+def parse_typed_fields(prompt_template: str) -> List[Tuple[str, str]]:
+    """
+    Parse prompt template to extract field names and types.
+    
+    Example: 'Given the {text:question} and {image:image_col}'
+    Returns: [('question', 'text'), ('image_col', 'image')]
+    """
+    pattern = r'\{(text|image):(\w+)\}'
+    matches = re.findall(pattern, prompt_template)
+    return [(field_name, field_type) for field_type, field_name in matches]
+
+def convert_image_to_base64_url(image_binary: bytes) -> str:
+    """
+    Convert binary image data to base64 data URL.
+    """
+    if image_binary is None:
+        return None
+    image_base64 = base64.b64encode(image_binary).decode('utf-8')
+    return f"data:image/jpeg;base64,{image_base64}"
+
+def post_http_request(
+    model: str,
+    prompts: List[str],
+    temperature: float = 1.0,
+    api_url: str = "http://localhost:8000/v1/chat/completions",
+    guided_choice: List[str] = None,
+    image_urls: List[List[str]] = None,  # Changed: List of lists for multiple images per prompt
+) -> requests.Response:
+    """
+    Send POST request to chat completions endpoint.
+    
+    Args:
+        model: Model name/identifier
+        prompts: List of text prompts
+        temperature: Sampling temperature
+        api_url: API endpoint URL
+        guided_choice: Optional guided choices
+        image_urls: Optional list of image URL lists (one list per prompt)
+    """
+    messages_list = []
+    
+    for i, prompt in enumerate(prompts):
+        content = []
+        
+        # Add text content
+        content.append({
+            "type": "text",
+            "text": prompt
+        })
+        
+        # Add images if provided
+        if image_urls and i < len(image_urls) and image_urls[i]:
+            for img_url in image_urls[i]:
+                if img_url:  # Skip None values
+                    content.append({
+                        "type": "image_url",
+                        "image_url": {
+                            "url": img_url
+                        }
+                    })
+        
+        messages_list.append({
+            "role": "user",
+            "content": content
+        })
+    
+    # Construct the payload
+    pload = {
+        "model": model,
+        "messages": messages_list,
+        "temperature": temperature,
+    }
+    
+    if guided_choice:
+        pload["guided_choice"] = guided_choice
+
+    headers = {"Content-Type": "application/json"}
+
+    req = requests.Request('POST', api_url, headers=headers, data=json.dumps(pload))
+    prepared = req.prepare()
+
+    with requests.Session() as session:
+        response = session.send(prepared)
+
+    return response
+
+def execute_batch_v2_with_images(
+    model,
+    fields: List[Dict[str, any]],
+    query: str,
+    typed_fields: List[Tuple[str, str]],
+    system_prompt: str = DEFAULT_SYSTEM_PROMPT,
+    guided_choice: List[str] = None,
+    base_url: str = None
+) -> List[str]:
+    """
+    Execute batch queries with support for text and image fields.
+    
+    Args:
+        model: The LLM model
+        fields: List of dictionaries containing field values
+        query: The query template with typed placeholders
+        typed_fields: List of (field_name, field_type) tuples
+        system_prompt: System prompt
+        guided_choice: Optional guided choices
+        base_url: API base URL
+    """
+    # Build user prompts and collect image URLs
+    user_prompts = []
+    all_image_urls = []
+    
+    for field_dict in fields:
+        # Replace text placeholders in the query
+        user_prompt = query
+        image_urls_for_this_prompt = []
+        
+        for field_name, field_type in typed_fields:
+            placeholder = f"{{{field_type}:{field_name}}}"
+            
+            if field_type == "text":
+                # Replace text placeholder with actual value
+                value = field_dict.get(field_name, "")
+                user_prompt = user_prompt.replace(placeholder, str(value))
+            
+            elif field_type == "image":
+                # Remove image placeholder from text and collect image URL
+                user_prompt = user_prompt.replace(placeholder, "[image]")
+                image_binary = field_dict.get(field_name)
+                
+                if image_binary is not None:
+                    image_url = convert_image_to_base64_url(image_binary)
+                    image_urls_for_this_prompt.append(image_url)
+        
+        user_prompts.append(user_prompt)
+        all_image_urls.append(image_urls_for_this_prompt if image_urls_for_this_prompt else None)
+    
+    # Generate full prompts with system prompt
+    prompts = [_generate_prompt(user_prompt=user_prompt, system_prompt=system_prompt) 
+               for user_prompt in user_prompts]
+    
+    outputs = []
+    
+    if base_url:
+        # For each prompt, send a separate HTTP POST request
+        for i, prompt in enumerate(prompts):
+            response = post_http_request(
+                model.model,
+                [prompt],
+                temperature=0,
+                api_url=(base_url + "/chat/completions"),  # Changed endpoint
+                guided_choice=guided_choice,
+                image_urls=[all_image_urls[i]] if all_image_urls[i] else None
+            )
+            request_output = json.loads(response.content)
+            choices = request_output.get('choices', [])
+            
+            if choices and 'message' in choices[0] and 'content' in choices[0]['message']:
+                outputs.append(choices[0]['message']['content'])
+            else:
+                outputs.append(None)
+        
+        return outputs
+    else:
+        # Use local engine (assuming it supports images)
+        request_outputs = model.engine.generate(
+            prompts=prompts,
+            sampling_params=model.sampling_params
+        )
+        return [output for output in request_outputs]
+
+
+# Helper function (placeholder - implement based on your existing code)
+def _generate_prompt(user_prompt: str, system_prompt: str) -> str:
+    """Generate the full prompt with system and user components."""
+    return f"{system_prompt}\n\n{user_prompt}"

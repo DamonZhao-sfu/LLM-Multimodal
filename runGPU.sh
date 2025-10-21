@@ -5,7 +5,7 @@ else
     echo "Defaulting to 1 GPU."
     NGPU=1
 fi
-TIME=$((180-30*$NGPU))
+TIME=$((120-30*$NGPU))
 HOURS=$(($TIME/60))
 MINUTES=$(($TIME%60))
 CORES_PER_GPU=16

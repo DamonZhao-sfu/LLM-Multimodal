@@ -165,37 +165,83 @@ def batchQuery(model: LLM,
 
 from pyspark.sql.functions import udf # Import the standard udf decorator
 
+# @pandas_udf(StringType(), PandasUDFType.SCALAR)
+# def llm_udf(prompts: pd.Series, *args: pd.Series) -> pd.Series:
+#     model = model_registry.model
+#     if model is None:
+#         raise RuntimeError("Registered model is not initialized.")
+    
+#     # Extract the prompt template from the first element (all rows use the same template)
+#     prompt_template = prompts.iloc[0]
+    
+#     # Extract the placeholder names from the prompt template.
+#     fields = get_fields(prompt_template)
+#     if len(args) != len(fields):
+#         raise ValueError(
+#             f"Expected {len(fields)} context column(s) (for placeholders {fields}), "
+#             f"but got {len(args)}."
+#         )
+    
+#     merged_df = pd.DataFrame({
+#         field: args[i] for i, field in enumerate(fields)
+#     })
+
+#     outputs = batchQuery(
+#         model=model,
+#         prompt=prompt_template,
+#         df=merged_df,
+#         system_prompt=DEFAULT_SYSTEM_PROMPT
+#     )
+
+#     # Convert the outputs to a Pandas Series
+#     return pd.Series(outputs)
+
+
 @pandas_udf(StringType(), PandasUDFType.SCALAR)
 def llm_udf(prompts: pd.Series, *args: pd.Series) -> pd.Series:
+    """
+    Enhanced LLM UDF with support for typed fields (text and image).
+    
+    Usage:
+        SELECT LLM('Given the {text:question} and {image:image_col} give me the answer', 
+                   question, image_col) as summary 
+        FROM table
+    """
     model = model_registry.model
     if model is None:
         raise RuntimeError("Registered model is not initialized.")
     
-    # Extract the prompt template from the first element (all rows use the same template)
+    # Extract the prompt template from the first element
     prompt_template = prompts.iloc[0]
-    
-    # Extract the placeholder names from the prompt template.
-    fields = get_fields(prompt_template)
-    if len(args) != len(fields):
+    print(prompt_template)
+    # Parse typed fields from the prompt template
+    typed_fields = parse_typed_fields(prompt_template)
+
+    if len(args) != len(typed_fields):
         raise ValueError(
-            f"Expected {len(fields)} context column(s) (for placeholders {fields}), "
+            f"Expected {len(typed_fields)} column(s) for fields {[f[0] for f in typed_fields]}, "
             f"but got {len(args)}."
         )
     
+    # Build dataframe with field values
     merged_df = pd.DataFrame({
-        field: args[i] for i, field in enumerate(fields)
+        field_name: args[i] for i, (field_name, field_type) in enumerate(typed_fields)
     })
-
-    outputs = batchQuery(
+    
+    # Convert dataframe rows to list of dictionaries
+    fields_list = merged_df.to_dict('records')
+    
+    # Execute batch query with image support
+    outputs = execute_batch_v2_with_images(
         model=model,
-        prompt=prompt_template,
-        df=merged_df,
-        system_prompt=DEFAULT_SYSTEM_PROMPT
+        fields=fields_list,
+        query=prompt_template,
+        typed_fields=typed_fields,
+        system_prompt=DEFAULT_SYSTEM_PROMPT,
+        base_url=model.base_url if hasattr(model, 'base_url') else None
     )
-
-    # Convert the outputs to a Pandas Series
+    
     return pd.Series(outputs)
-
 
 # Pyspark UDF
 # @pandas_udf(StringType(), PandasUDFType.SCALAR)

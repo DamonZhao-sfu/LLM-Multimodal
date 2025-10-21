@@ -46,9 +46,7 @@ prompt_text = (
     f"provide a concise summary of the content and key details"
 ).replace("'", "''")
 
-query_sql = f"SELECT LLM('{prompt_text}', {sql_columns}) AS llm_summary FROM pope"
-print(query_sql)
-result_df = spark.sql("SELECT LLM('Given the {question} give me the answer', question) as summary FROM pope")
+result_df = spark.sql("SELECT LLM('Given the {text:question} and {image:image} give me the summary of the image', question, image) as summary FROM pope")
 result_df.explain()
 result_df.show()
 #result_df.coalesce(1).write.mode("overwrite").option("header", "true").csv(output_path)
