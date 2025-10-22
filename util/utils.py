@@ -14,7 +14,8 @@ from typing import List, Tuple
 from pyspark.sql import SparkSession
 from itertools import combinations
 import yaml
-
+import base64
+import numpy as np
 
 class LLM(abc.ABC):
     @abc.abstractmethod
@@ -38,74 +39,62 @@ class LLM(abc.ABC):
 
 
 def get_tokenizer():
-    return AutoTokenizer.from_pretrained("/scratch/hpc-prf-haqc/haikai/LLM-Multimodal/llama-tokenizer")
+    return AutoTokenizer.from_pretrained("/home/haikai/LLM-Multimodal/llama-tokenizer")
     #return AutoTokenizer.from_pretrained("/home/haikai/LLM-SQL/llama-tokenizer")
     #return AutoTokenizer.from_pretrained("/home/haikai/llama-tokenizer")
 
-def post_http_request(
-    model: str,
-    prompts: List[str],
-    temperature: float = 1.0,
-    api_url: str = "http://localhost:8000/v1/chat/completions",
-    guided_choice: List[str] = None,
-    image_urls: List[str] = None,
-) -> requests.Response:
-    """
-    Send POST request to chat completions endpoint.
+# def post_http_request(
+#     model: str,
+#     prompts: List[str],
+#     temperature: float = 1.0,
+#     api_url: str = "http://localhost:8000/v1/chat/completions",
+#     guided_choice: List[str] = None,
+#     image_urls: List[str] = None,
+# ) -> requests.Response:
+#     messages_list = []
     
-    Args:
-        model: Model name/identifier
-        prompts: List of text prompts
-        temperature: Sampling temperature
-        api_url: API endpoint URL
-        guided_choice: Optional guided choices
-        image_urls: Optional list of image URLs (one per prompt, or None for text-only)
-    """
-    # Construct messages for each prompt
-    messages_list = []
-    
-    for i, prompt in enumerate(prompts):
-        content = []
+#     for i, prompt in enumerate(prompts):
+#         content = []
         
-        # Add text content
-        content.append({
-            "type": "text",
-            "text": prompt
-        })
+#         # Add text content
+#         content.append({
+#             "type": "text",
+#             "text": prompt
+#         })
         
-        # Add image if provided
-        if image_urls and i < len(image_urls) and image_urls[i]:
-            content.append({
-                "type": "image_url",
-                "image_url": {
-                    "url": image_urls[i]
-                }
-            })
+#         # Add image if provided
+#         if image_urls and i < len(image_urls) and image_urls[i]:
+#             content.append({
+#                 "type": "image_url",
+#                 "image_url": {
+#                     "url": image_urls[i]
+#                 }
+#             })
         
-        messages_list.append({
-            "role": "user",
-            "content": content
-        })
+#         messages_list.append({
+#             "role": "user",
+#             "content": content
+#         })
     
-    # Construct the payload
-    pload = {
-        "model": model,
-        "messages": messages_list,
-        "temperature": temperature,
-    }
+#     # Construct the payload
+#     pload = {
+#         "model": model,
+#         "messages": messages_list,
+#         "temperature": temperature,
+#     }
     
-    if guided_choice:
-        pload["guided_choice"] = guided_choice
+#     if guided_choice:
+#         pload["guided_choice"] = guided_choice
 
-    headers = {"Content-Type": "application/json"}
+#     headers = {"Content-Type": "application/json"}
 
-    req = requests.Request('POST', api_url, headers=headers, data=json.dumps(pload))
-    prepared = req.prepare()
+#     req = requests.Request('POST', api_url, headers=headers, data=json.dumps(pload))
+#     prepared = req.prepare()
 
-    with requests.Session() as session:
-        response = session.send(prepared)
+#     with requests.Session() as session:
+#         response = session.send(prepared)
 
-    return response
+#     return response
 
 
 async def async_post_http_request(
@@ -239,12 +228,40 @@ def parse_typed_fields(prompt_template: str) -> List[Tuple[str, str]]:
     matches = re.findall(pattern, prompt_template)
     return [(field_name, field_type) for field_type, field_name in matches]
 
-def convert_image_to_base64_url(image_binary: bytes) -> str:
+# def convert_image_to_base64_url(image_binary: bytes) -> str:
+#     """
+#     Convert binary image data to base64 data URL.
+#     """
+#     if image_binary is None:
+#         return None
+#     image_base64 = base64.b64encode(image_binary).decode('utf-8')
+#     return f"data:image/jpeg;base64,{image_base64}"
+
+
+def convert_image_to_base64_url(image_binary) -> str:
     """
     Convert binary image data to base64 data URL.
+    Handles both bytes and list/array inputs.
     """
     if image_binary is None:
         return None
+    
+    # Convert list or array to bytes if needed
+    if isinstance(image_binary, list):
+        # If it's a list of integers (byte values), convert to bytes
+        image_binary = bytes(image_binary)
+    elif isinstance(image_binary, np.ndarray):
+        # If it's a numpy array, convert to bytes
+        image_binary = image_binary.tobytes()
+    elif not isinstance(image_binary, bytes):
+        # If it's some other type, try to convert it
+        try:
+            image_binary = bytes(image_binary)
+        except TypeError:
+            raise TypeError(f"Cannot convert {type(image_binary)} to bytes")
+    
+    
+    # Now encode to base64
     image_base64 = base64.b64encode(image_binary).decode('utf-8')
     return f"data:image/jpeg;base64,{image_base64}"
 
@@ -321,7 +338,7 @@ def execute_batch_v2_with_images(
     typed_fields: List[Tuple[str, str]],
     system_prompt: str = DEFAULT_SYSTEM_PROMPT,
     guided_choice: List[str] = None,
-    base_url: str = None
+    base_url: str = "http://localhost:8000/v1"
 ) -> List[str]:
     """
     Execute batch queries with support for text and image fields.
@@ -348,15 +365,12 @@ def execute_batch_v2_with_images(
             placeholder = f"{{{field_type}:{field_name}}}"
             
             if field_type == "text":
-                # Replace text placeholder with actual value
                 value = field_dict.get(field_name, "")
                 user_prompt = user_prompt.replace(placeholder, str(value))
             
             elif field_type == "image":
-                # Remove image placeholder from text and collect image URL
                 user_prompt = user_prompt.replace(placeholder, "[image]")
-                image_binary = field_dict.get(field_name)
-                
+                image_binary = field_dict.get(field_name)[0]
                 if image_binary is not None:
                     image_url = convert_image_to_base64_url(image_binary)
                     image_urls_for_this_prompt.append(image_url)
@@ -369,10 +383,10 @@ def execute_batch_v2_with_images(
                for user_prompt in user_prompts]
     
     outputs = []
-    
     if base_url:
         # For each prompt, send a separate HTTP POST request
         for i, prompt in enumerate(prompts):
+            print(prompt)
             response = post_http_request(
                 model.model,
                 [prompt],

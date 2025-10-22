@@ -43,12 +43,12 @@ class ModelRegistry:
                 if not self._initialized:
                     print("Initializing global model...")
                     engine_args = EngineArgs(
-                        model="llava-hf/llava-1.5-7b-hf",
+                        model="/data/models/llava-1.5-7b-hf",
                         max_num_seqs=1024
                     )
                     self._model = vLLM(
                         engine_args=engine_args,
-                        base_url="http://localhost:8000/v1/chat"
+                        base_url="http://localhost:8000/v1"
                     )
                     self._tokenizer = get_tokenizer()
                     self._initialized = True
@@ -74,12 +74,6 @@ global_table_name = ""
 algo_config = "quick_greedy"
 
 base_path = os.path.dirname(os.path.abspath(__file__))
-# solver_config_path = dataset_config_path = os.path.join(base_path+"/../", "solver_configs", f"{algo_config}.yaml")
-# solver_config = read_yaml(solver_config_path)
-# algo = solver_config["algorithm"]
-# merged_cols = [] if not solver_config.get("colmerging", True) else data_config["merged_columns"]
-# one_deps = []
-# default_distinct_value_threshold = 0.0
 
 processed_row = 0
 
@@ -165,38 +159,6 @@ def batchQuery(model: LLM,
 
 from pyspark.sql.functions import udf # Import the standard udf decorator
 
-# @pandas_udf(StringType(), PandasUDFType.SCALAR)
-# def llm_udf(prompts: pd.Series, *args: pd.Series) -> pd.Series:
-#     model = model_registry.model
-#     if model is None:
-#         raise RuntimeError("Registered model is not initialized.")
-    
-#     # Extract the prompt template from the first element (all rows use the same template)
-#     prompt_template = prompts.iloc[0]
-    
-#     # Extract the placeholder names from the prompt template.
-#     fields = get_fields(prompt_template)
-#     if len(args) != len(fields):
-#         raise ValueError(
-#             f"Expected {len(fields)} context column(s) (for placeholders {fields}), "
-#             f"but got {len(args)}."
-#         )
-    
-#     merged_df = pd.DataFrame({
-#         field: args[i] for i, field in enumerate(fields)
-#     })
-
-#     outputs = batchQuery(
-#         model=model,
-#         prompt=prompt_template,
-#         df=merged_df,
-#         system_prompt=DEFAULT_SYSTEM_PROMPT
-#     )
-
-#     # Convert the outputs to a Pandas Series
-#     return pd.Series(outputs)
-
-
 @pandas_udf(StringType(), PandasUDFType.SCALAR)
 def llm_udf(prompts: pd.Series, *args: pd.Series) -> pd.Series:
     """
@@ -224,9 +186,24 @@ def llm_udf(prompts: pd.Series, *args: pd.Series) -> pd.Series:
         )
     
     # Build dataframe with field values
-    merged_df = pd.DataFrame({
-        field_name: args[i] for i, (field_name, field_type) in enumerate(typed_fields)
-    })
+    # merged_df = pd.DataFrame({
+    #     field_name: args[i] for i, (field_name, field_type) in enumerate(typed_fields)
+    # })
+    data_dict = {}
+    for i, (field_name, field_type) in enumerate(typed_fields):
+        arg = args[i]
+        # Check if it's a DataFrame or Series and convert appropriately
+        if isinstance(arg, pd.DataFrame):
+            # If it's a DataFrame, convert to list of values
+            data_dict[field_name] = arg.values.tolist()
+        elif isinstance(arg, pd.Series):
+            # If it's a Series, convert to list
+            data_dict[field_name] = arg.tolist()
+        else:
+            # Fallback: try to convert directly
+            data_dict[field_name] = list(arg)
+
+    merged_df = pd.DataFrame(data_dict)
     
     # Convert dataframe rows to list of dictionaries
     fields_list = merged_df.to_dict('records')
@@ -238,35 +215,40 @@ def llm_udf(prompts: pd.Series, *args: pd.Series) -> pd.Series:
         query=prompt_template,
         typed_fields=typed_fields,
         system_prompt=DEFAULT_SYSTEM_PROMPT,
-        base_url=model.base_url if hasattr(model, 'base_url') else None
+        guided_choice=["Yes", "No"],
+        base_url="http://localhost:8000/v1"
     )
     
     return pd.Series(outputs)
 
-# Pyspark UDF
 # @pandas_udf(StringType(), PandasUDFType.SCALAR)
 # def llm_udf_v2(prompts: pd.Series, *dataFrames: pd.Series) -> pd.Series:
 #     """
 #     UDF that processes batches of data with LLM queries.
-    
-#     Args:
-#         prompts: Series containing the same prompt template for all rows
-#         *dataFrames: Variable number of Series, each containing values from a column
-    
-#     Returns:
-#         Series containing LLM responses
 #     """
+#     import re
+#     import pandas as pd
+#     import time
+    
+#     # Define get_fields inside the UDF to avoid pickling issues
+#     def get_fields_local(user_prompt: str):
+#         """Get the names of all the fields specified in the user prompt."""
+#         pattern = r"{(.*?)}"
+#         return re.findall(pattern, user_prompt)
+    
 #     print(f"len of prompts: {len(prompts)}")
 #     print(f"number of data columns: {len(dataFrames)}")
     
-#     # Get the prompt template from the first row (same for all rows)
+#     # Get the prompt template from the first row
 #     prompt_template = prompts.iloc[0]
     
-#     # Get the global model instance
-#     model = model_registry.model
+#     # Get the global model instance - import inside UDF
+#     from util.register import ModelRegistry
+#     model_reg = ModelRegistry()
+#     model = model_reg.model
     
-#     # Extract field placeholders from the prompt (e.g., {id}, {question}, etc.)
-#     fields = get_fields(prompt_template)
+#     # Extract field placeholders from the prompt
+#     fields = get_fields_local(prompt_template)
     
 #     # Validate that we have the right number of columns
 #     if len(dataFrames) != len(fields):
@@ -276,7 +258,6 @@ def llm_udf(prompts: pd.Series, *args: pd.Series) -> pd.Series:
 #         )
     
 #     # Create DataFrame from the column values
-#     # Each Series in dataFrames contains values for one column across all rows
 #     merged_df = pd.DataFrame({
 #         field: dataFrames[i] for i, field in enumerate(fields)
 #     })
@@ -284,7 +265,10 @@ def llm_udf(prompts: pd.Series, *args: pd.Series) -> pd.Series:
 #     print(f"Merged DataFrame shape: {merged_df.shape}")
 #     print(f"Sample row:\n{merged_df.head(1)}")
     
-#     # Execute batch query
+#     # Execute batch query - import inside UDF
+#     from util.register import batchQuery
+#     from util.prompt import DEFAULT_SYSTEM_PROMPT
+    
 #     before_query_time = time.time()
 #     outputs = batchQuery(
 #         model=model,
@@ -297,68 +281,6 @@ def llm_udf(prompts: pd.Series, *args: pd.Series) -> pd.Series:
 #     print(f"Batch query time: {end_time - before_query_time:.4f} seconds")
     
 #     return pd.Series(outputs)
-
-
-@pandas_udf(StringType(), PandasUDFType.SCALAR)
-def llm_udf_v2(prompts: pd.Series, *dataFrames: pd.Series) -> pd.Series:
-    """
-    UDF that processes batches of data with LLM queries.
-    """
-    import re
-    import pandas as pd
-    import time
-    
-    # Define get_fields inside the UDF to avoid pickling issues
-    def get_fields_local(user_prompt: str):
-        """Get the names of all the fields specified in the user prompt."""
-        pattern = r"{(.*?)}"
-        return re.findall(pattern, user_prompt)
-    
-    print(f"len of prompts: {len(prompts)}")
-    print(f"number of data columns: {len(dataFrames)}")
-    
-    # Get the prompt template from the first row
-    prompt_template = prompts.iloc[0]
-    
-    # Get the global model instance - import inside UDF
-    from util.register import ModelRegistry
-    model_reg = ModelRegistry()
-    model = model_reg.model
-    
-    # Extract field placeholders from the prompt
-    fields = get_fields_local(prompt_template)
-    
-    # Validate that we have the right number of columns
-    if len(dataFrames) != len(fields):
-        raise ValueError(
-            f"Expected {len(fields)} context column(s) (for placeholders {fields}), "
-            f"but got {len(dataFrames)}."
-        )
-    
-    # Create DataFrame from the column values
-    merged_df = pd.DataFrame({
-        field: dataFrames[i] for i, field in enumerate(fields)
-    })
-    
-    print(f"Merged DataFrame shape: {merged_df.shape}")
-    print(f"Sample row:\n{merged_df.head(1)}")
-    
-    # Execute batch query - import inside UDF
-    from util.register import batchQuery
-    from util.prompt import DEFAULT_SYSTEM_PROMPT
-    
-    before_query_time = time.time()
-    outputs = batchQuery(
-        model=model,
-        prompt=prompt_template,
-        df=merged_df,
-        system_prompt=DEFAULT_SYSTEM_PROMPT
-    )
-    end_time = time.time()
-    
-    print(f"Batch query time: {end_time - before_query_time:.4f} seconds")
-    
-    return pd.Series(outputs)
 
 
 # Register the LLM UDF with Spark

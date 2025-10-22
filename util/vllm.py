@@ -117,10 +117,8 @@ class vLLM(LLM):
         user_prompts = [user_prompt_template.replace("{{fields_json}}", fields_json) for fields_json in fields_json_list]
 
         prompts = [self._generate_prompt(user_prompt=user_prompt, system_prompt=system_prompt) for user_prompt in user_prompts]
-        print("len of prompts"+ len(prompts))
         if self.base_url:
             request_outputs = json.loads(post_http_request(self.model, prompts, temperature=0, api_url=(self.base_url + "/completions"), guided_choice=guided_choice).content)
-            print(request_outputs)
             return [choice['message']['content'] for choice in request_outputs['choices']]
         else:
             request_outputs = self.engine.generate(prompts=prompts, sampling_params=self.sampling_params)

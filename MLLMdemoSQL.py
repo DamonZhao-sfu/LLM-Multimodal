@@ -4,7 +4,7 @@ import time
 import pandas as pd
 import numpy as np
 from pyspark.sql import SparkSession
-from util.register import set_global_state, llm_udf, llm_udf_v2
+from util.register import set_global_state, llm_udf
 from util.utils import *
 import re
 import json
@@ -25,12 +25,12 @@ spark = SparkSession.builder \
     
 set_global_state(spark, "pope")
 spark.udf.register("LLM", llm_udf)
-POPE_PATH = "/scratch/hpc-prf-haqc/haikai/dataset/POPE/random-00000-of-00001.parquet"
+POPE_PATH = "/home/haikai/haikai/entropyTest/POPE.parquet"
 
 start_time = time.time()
 
 # Read POPE parquet and create temp view
-pope_df = spark.read.parquet(POPE_PATH)
+pope_df = spark.read.parquet(POPE_PATH).limit(100)
 pope_df.createOrReplaceTempView("pope")
 
 # Build LLM SQL based on POPE schema
@@ -46,9 +46,9 @@ prompt_text = (
     f"provide a concise summary of the content and key details"
 ).replace("'", "''")
 
-result_df = spark.sql("SELECT LLM('Given the {text:question} and {image:image} give me the summary of the image', question, image) as summary FROM pope")
+result_df = spark.sql("SELECT LLM('Given the text: {text:question} and image: {image:image} give me the answer to the question', question, image) as summary FROM pope LIMIT 10")
 result_df.explain()
-result_df.show()
-#result_df.coalesce(1).write.mode("overwrite").option("header", "true").csv(output_path)
+#result_df.show(Truncated=False)
+result_df.coalesce(1).write.mode("overwrite").option("header", "true").csv(output_path)
 
 end_time = time.time()
