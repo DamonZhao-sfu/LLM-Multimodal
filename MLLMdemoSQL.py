@@ -4,8 +4,9 @@ import time
 import pandas as pd
 import numpy as np
 from pyspark.sql import SparkSession
-from util.register import set_global_state, llm_udf
+from util.register import *
 from util.utils import *
+from util.cdencoder import *
 import re
 import json
 from typing import List, Dict, Optional
@@ -17,14 +18,14 @@ output_path = "./demoResult.csv"
 
 spark = SparkSession.builder \
     .appName("LLM SQL Test") \
-    .config("spark.driver.memory", "8g") \
-    .config("spark.executor.memory", "8g") \
+    .config("spark.driver.memory", "64g") \
+    .config("spark.executor.memory", "128g") \
     .config("spark.sql.execution.arrow.maxRecordsPerBatch", 50000) \
     .config("spark.driver.maxResultSize", "4g") \
     .getOrCreate()
     
 set_global_state(spark, "pope")
-spark.udf.register("LLM", llm_udf)
+spark.udf.register("LLM", llm_udf_embedding)
 POPE_PATH = "/home/haikai/haikai/entropyTest/POPE.parquet"
 
 start_time = time.time()
@@ -48,7 +49,6 @@ prompt_text = (
 
 result_df = spark.sql("SELECT LLM('Given the text: {text:question} and image: {image:image} give me the answer to the question', question, image) as summary FROM pope LIMIT 10")
 result_df.explain()
-#result_df.show(Truncated=False)
 result_df.coalesce(1).write.mode("overwrite").option("header", "true").csv(output_path)
 
 end_time = time.time()

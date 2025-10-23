@@ -11,9 +11,10 @@ from vllm import EngineArgs
 from threading import Lock
 from util.prompt import DEFAULT_SYSTEM_PROMPT
 from util.vllm import vLLM
-from util.utils import LLM, get_ordered_columns
 from pandas import DataFrame
 from util.utils import *
+from util.cdencoder import *
+from util.mllm import *
 from string import Formatter
 import os
 from pyspark.sql.functions import col, window, expr, sum, avg, count, when, lit, unix_timestamp, date_format, pandas_udf
@@ -76,6 +77,14 @@ algo_config = "quick_greedy"
 base_path = os.path.dirname(os.path.abspath(__file__))
 
 processed_row = 0
+
+MODEL_PATH = "/data/models/llava-1.5-7b-hf"
+model = LlavaForConditionalGeneration.from_pretrained(
+    MODEL_PATH, 
+    torch_dtype=torch.float16, 
+    device_map="cuda",
+    attn_implementation="eager"
+)
 
 def init(model_runner: LLM):
     global REGISTERED_MODEL
@@ -175,8 +184,6 @@ def llm_udf(prompts: pd.Series, *args: pd.Series) -> pd.Series:
     
     # Extract the prompt template from the first element
     prompt_template = prompts.iloc[0]
-    print(prompt_template)
-    # Parse typed fields from the prompt template
     typed_fields = parse_typed_fields(prompt_template)
 
     if len(args) != len(typed_fields):
@@ -185,22 +192,14 @@ def llm_udf(prompts: pd.Series, *args: pd.Series) -> pd.Series:
             f"but got {len(args)}."
         )
     
-    # Build dataframe with field values
-    # merged_df = pd.DataFrame({
-    #     field_name: args[i] for i, (field_name, field_type) in enumerate(typed_fields)
-    # })
     data_dict = {}
     for i, (field_name, field_type) in enumerate(typed_fields):
         arg = args[i]
-        # Check if it's a DataFrame or Series and convert appropriately
         if isinstance(arg, pd.DataFrame):
-            # If it's a DataFrame, convert to list of values
             data_dict[field_name] = arg.values.tolist()
         elif isinstance(arg, pd.Series):
-            # If it's a Series, convert to list
             data_dict[field_name] = arg.tolist()
         else:
-            # Fallback: try to convert directly
             data_dict[field_name] = list(arg)
 
     merged_df = pd.DataFrame(data_dict)
@@ -221,66 +220,57 @@ def llm_udf(prompts: pd.Series, *args: pd.Series) -> pd.Series:
     
     return pd.Series(outputs)
 
-# @pandas_udf(StringType(), PandasUDFType.SCALAR)
-# def llm_udf_v2(prompts: pd.Series, *dataFrames: pd.Series) -> pd.Series:
-#     """
-#     UDF that processes batches of data with LLM queries.
-#     """
-#     import re
-#     import pandas as pd
-#     import time
+@pandas_udf(StringType(), PandasUDFType.SCALAR)
+def llm_udf_embedding(prompts: pd.Series, *args: pd.Series) -> pd.Series:
+    """
+    Enhanced LLM UDF with support for typed fields (text and image).
     
-#     # Define get_fields inside the UDF to avoid pickling issues
-#     def get_fields_local(user_prompt: str):
-#         """Get the names of all the fields specified in the user prompt."""
-#         pattern = r"{(.*?)}"
-#         return re.findall(pattern, user_prompt)
+    Usage:
+        SELECT LLM('Given the {text:question} and {image:image_col} give me the answer', 
+                   question, image_col) as summary 
+        FROM table
+    """
+    modelname = model_registry.model
+    if modelname is None:
+        raise RuntimeError("Registered model is not initialized.")
     
-#     print(f"len of prompts: {len(prompts)}")
-#     print(f"number of data columns: {len(dataFrames)}")
-    
-#     # Get the prompt template from the first row
-#     prompt_template = prompts.iloc[0]
-    
-#     # Get the global model instance - import inside UDF
-#     from util.register import ModelRegistry
-#     model_reg = ModelRegistry()
-#     model = model_reg.model
-    
-#     # Extract field placeholders from the prompt
-#     fields = get_fields_local(prompt_template)
-    
-#     # Validate that we have the right number of columns
-#     if len(dataFrames) != len(fields):
-#         raise ValueError(
-#             f"Expected {len(fields)} context column(s) (for placeholders {fields}), "
-#             f"but got {len(dataFrames)}."
-#         )
-    
-#     # Create DataFrame from the column values
-#     merged_df = pd.DataFrame({
-#         field: dataFrames[i] for i, field in enumerate(fields)
-#     })
-    
-#     print(f"Merged DataFrame shape: {merged_df.shape}")
-#     print(f"Sample row:\n{merged_df.head(1)}")
-    
-#     # Execute batch query - import inside UDF
-#     from util.register import batchQuery
-#     from util.prompt import DEFAULT_SYSTEM_PROMPT
-    
-#     before_query_time = time.time()
-#     outputs = batchQuery(
-#         model=model,
-#         prompt=prompt_template,
-#         df=merged_df,
-#         system_prompt=DEFAULT_SYSTEM_PROMPT
-#     )
-#     end_time = time.time()
-    
-#     print(f"Batch query time: {end_time - before_query_time:.4f} seconds")
-    
-#     return pd.Series(outputs)
+    # Extract the prompt template from the first element
+    prompt_template = prompts.iloc[0]
+    print(prompt_template)
+    # Parse typed fields from the prompt template
+    typed_fields = parse_typed_fields(prompt_template)
 
+    if len(args) != len(typed_fields):
+        raise ValueError(
+            f"Expected {len(typed_fields)} column(s) for fields {[f[0] for f in typed_fields]}, "
+            f"but got {len(args)}."
+        )
+    
+    data_dict = {}
+    for i, (field_name, field_type) in enumerate(typed_fields):
+        arg = args[i]
+        if isinstance(arg, pd.DataFrame):
+            data_dict[field_name] = arg.values.tolist()
+        elif isinstance(arg, pd.Series):
+            data_dict[field_name] = arg.tolist()
+        else:
+            data_dict[field_name] = list(arg)
 
-# Register the LLM UDF with Spark
+    merged_df = pd.DataFrame(data_dict)
+    
+    # Convert dataframe rows to list of dictionaries
+    fields_list = merged_df.to_dict('records')
+    
+    # Execute batch query with image support
+    outputs = execute_batch_v2_with_pruned_embeddings(
+        model=model,
+        modelname="/data/models/llava-1.5-7b-hf",
+        fields=fields_list,
+        query=prompt_template,
+        typed_fields=typed_fields,
+        system_prompt=DEFAULT_SYSTEM_PROMPT,
+        guided_choice=["Yes", "No"],
+        base_url="http://localhost:8000/v1"
+    )
+    
+    return pd.Series(outputs)

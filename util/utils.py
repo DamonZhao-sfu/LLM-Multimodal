@@ -17,6 +17,8 @@ import yaml
 import base64
 import numpy as np
 
+GPU_DEVICES = "4,5"
+
 class LLM(abc.ABC):
     @abc.abstractmethod
     def execute(self, fields: Dict[str, str], query: str, system_prompt: str = DEFAULT_SYSTEM_PROMPT) -> str:
@@ -40,62 +42,6 @@ class LLM(abc.ABC):
 
 def get_tokenizer():
     return AutoTokenizer.from_pretrained("/home/haikai/LLM-Multimodal/llama-tokenizer")
-    #return AutoTokenizer.from_pretrained("/home/haikai/LLM-SQL/llama-tokenizer")
-    #return AutoTokenizer.from_pretrained("/home/haikai/llama-tokenizer")
-
-# def post_http_request(
-#     model: str,
-#     prompts: List[str],
-#     temperature: float = 1.0,
-#     api_url: str = "http://localhost:8000/v1/chat/completions",
-#     guided_choice: List[str] = None,
-#     image_urls: List[str] = None,
-# ) -> requests.Response:
-#     messages_list = []
-    
-#     for i, prompt in enumerate(prompts):
-#         content = []
-        
-#         # Add text content
-#         content.append({
-#             "type": "text",
-#             "text": prompt
-#         })
-        
-#         # Add image if provided
-#         if image_urls and i < len(image_urls) and image_urls[i]:
-#             content.append({
-#                 "type": "image_url",
-#                 "image_url": {
-#                     "url": image_urls[i]
-#                 }
-#             })
-        
-#         messages_list.append({
-#             "role": "user",
-#             "content": content
-#         })
-    
-#     # Construct the payload
-#     pload = {
-#         "model": model,
-#         "messages": messages_list,
-#         "temperature": temperature,
-#     }
-    
-#     if guided_choice:
-#         pload["guided_choice"] = guided_choice
-
-#     headers = {"Content-Type": "application/json"}
-
-#     req = requests.Request('POST', api_url, headers=headers, data=json.dumps(pload))
-#     prepared = req.prepare()
-
-#     with requests.Session() as session:
-#         response = session.send(prepared)
-
-#     return response
-
 
 async def async_post_http_request(
     session: aiohttp.ClientSession,
@@ -417,3 +363,41 @@ def execute_batch_v2_with_images(
 def _generate_prompt(user_prompt: str, system_prompt: str) -> str:
     """Generate the full prompt with system and user components."""
     return f"{system_prompt}\n\n{user_prompt}"
+
+
+def initialize_model_for_pruning(model_path: str):
+    """
+    Initialize the model for pruning on the executor.
+    This loads the vision model on the specified GPU.
+    """
+    import torch
+    import os
+    from transformers import LlavaForConditionalGeneration, AutoProcessor
+    
+    # Set CUDA device in the worker process
+    os.environ['CUDA_VISIBLE_DEVICES'] = GPU_DEVICES
+    
+    # Force re-initialization of CUDA context
+    torch.cuda.init()
+    
+    print(f"Available GPUs after setting CUDA_VISIBLE_DEVICES: {torch.cuda.device_count()}")
+    print(f"Current CUDA device: {torch.cuda.current_device()}")
+    
+    try:
+        # Load model with CPU first to avoid OOM
+        print(f"Loading model from {model_path}")
+        model = LlavaForConditionalGeneration.from_pretrained(
+            model_path,
+            torch_dtype=torch.float16,
+            low_cpu_mem_usage=True,
+            device_map="auto"  # Automatically distribute across available GPUs
+        )
+        model.eval()
+        
+        print(f"Model loaded successfully on device: {next(model.parameters()).device}")
+        
+        return model
+        
+    except Exception as e:
+        print(f"Error loading model: {e}")
+        raise
