@@ -2,17 +2,12 @@ import sys
 import os
 import time
 import pandas as pd
-import numpy as np
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import pandas_udf, PandasUDFType, col, when, lower, trim
+from pyspark.sql.functions import pandas_udf, col, when, lower, trim
 from pyspark.sql.types import StringType
-import torch
-import json
-from typing import Iterator, Tuple
 from util.mllm import *
 from util.utils import *
 from util.cdencoder import *
-from transformers import LlavaForConditionalGeneration, LlavaProcessor, CLIPVisionModel, CLIPImageProcessor
 
 # Get the absolute path of the project root
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "./"))

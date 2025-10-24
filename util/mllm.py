@@ -5,22 +5,16 @@ from util.cdencoder import CLIPVisionTower
 from transformers import LlavaForConditionalGeneration, LlavaProcessor, CLIPVisionModel, CLIPImageProcessor
 import time
 import torch
-import numpy as np
 from PIL import Image
 import requests
 import json
 import io
 import base64
-import os
-import csv
-import pandas as pd
 import json
 import time
-from typing import List, Dict, Tuple, Any, Optional
-from datetime import datetime
+from typing import List, Dict, Tuple
 from util.prompt import DEFAULT_SYSTEM_PROMPT
 from util.utils import _generate_prompt
-from threading import Lock
 
 
 # class VisionTowerRegistry:
