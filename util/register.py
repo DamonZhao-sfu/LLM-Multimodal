@@ -25,252 +25,188 @@ import csv
 import os
 from threading import Thread
 
-class ModelRegistry:
-    _instance = None
-    _lock = Lock()
-    _model = None
-    _initialized = False
+# class ModelRegistry:
+#     _instance = None
+#     _lock = Lock()
+#     _model = None
+#     _initialized = False
 
-    def __new__(cls):
-        if cls._instance is None:
-            with cls._lock:
-                if cls._instance is None:
-                    cls._instance = super(ModelRegistry, cls).__new__(cls)
-        return cls._instance
+#     def __new__(cls):
+#         if cls._instance is None:
+#             with cls._lock:
+#                 if cls._instance is None:
+#                     cls._instance = super(ModelRegistry, cls).__new__(cls)
+#         return cls._instance
 
-    def initialize_model(self):
-        if not self._initialized:
-            with self._lock:
-                if not self._initialized:
-                    print("Initializing global model...")
-                    engine_args = EngineArgs(
-                        model="/data/models/llava-1.5-7b-hf",
-                        max_num_seqs=1024
-                    )
-                    self._model = vLLM(
-                        engine_args=engine_args,
-                        base_url="http://localhost:8000/v1"
-                    )
-                    self._tokenizer = get_tokenizer()
-                    self._initialized = True
-                    print("Global model initialized successfully.")
+#     def initialize_model(self):
+#         if not self._initialized:
+#             with self._lock:
+#                 if not self._initialized:
+#                     engine_args = EngineArgs(
+#                         model="/data/models/llava-1.5-7b-hf",
+#                         max_num_seqs=1024
+#                     )
+#                     self._model = vLLM(
+#                         engine_args=engine_args,
+#                         base_url="http://localhost:8000/v1"
+#                     )
+#                     self._tokenizer = get_tokenizer()
+#                     self._initialized = True
+#                     print("Global model initialized successfully.")
 
-    @property
-    def tokenizer(self):
-        if not hasattr(self, '_tokenizer'):
-            self._tokenizer = get_tokenizer()
-        return self._tokenizer
+#     @property
+#     def tokenizer(self):
+#         if not hasattr(self, '_tokenizer'):
+#             self._tokenizer = get_tokenizer()
+#         return self._tokenizer
 
-    @property
-    def model(self) -> LLM:
-        if not self._initialized:
-            self.initialize_model()
-        return self._model
+#     @property
+#     def model(self) -> LLM:
+#         if not self._initialized:
+#             self.initialize_model()
+#         return self._model
 
-# Global variables
-model_registry = ModelRegistry()
-global_spark = None
-global_table_name = ""
+# # Global variables
+# model_registry = ModelRegistry()
+# global_spark = None
+# global_table_name = ""
 
-algo_config = "quick_greedy"
+# algo_config = "quick_greedy"
 
-base_path = os.path.dirname(os.path.abspath(__file__))
+# base_path = os.path.dirname(os.path.abspath(__file__))
 
-processed_row = 0
+# processed_row = 0
 
-MODEL_PATH = "/data/models/llava-1.5-7b-hf"
-model = LlavaForConditionalGeneration.from_pretrained(
-    MODEL_PATH, 
-    torch_dtype=torch.float16, 
-    device_map="cuda",
-    attn_implementation="eager"
-)
+# # MODEL_PATH = "/data/models/llava-1.5-7b-hf"
+# # model = LlavaForConditionalGeneration.from_pretrained(
+# #     MODEL_PATH, 
+# #     torch_dtype=torch.float16, 
+# #     device_map="cuda",
+# #     attn_implementation="eager"
+# # )
+# def init(model_runner: LLM):
+#     global REGISTERED_MODEL
+#     REGISTERED_MODEL = model_runner
 
-def init(model_runner: LLM):
-    global REGISTERED_MODEL
-    REGISTERED_MODEL = model_runner
-
-def set_global_state(spark, table_name):
-    global global_spark, global_table_name
-    global_spark = spark
-    global_table_name = table_name
-    # Initialize the model when setting global state
-    model_registry.initialize_model()
+# def set_global_state(spark, table_name):
+#     global global_spark, global_table_name
+#     global_spark = spark
+#     global_table_name = table_name
+#     # Initialize the model when setting global state
+#     model_registry.initialize_model()
 
 
-def register_llm_udf():
-    global_spark.udf.register("LLM", llm_udf)
+# def register_llm_udf():
+#     global_spark.udf.register("LLM", llm_udf)
 
 
-def get_fields(user_prompt: str) -> List[str]:
-    """Get the names of all the fields specified in the user prompt."""
-    if not isinstance(user_prompt, str):
-        raise ValueError("Expected a string for user_prompt, got: {}".format(type(user_prompt)))
-    pattern = r"{(.*?)}"
-    return re.findall(pattern, user_prompt)
+# def get_fields(user_prompt: str) -> List[str]:
+#     """Get the names of all the fields specified in the user prompt."""
+#     if not isinstance(user_prompt, str):
+#         raise ValueError("Expected a string for user_prompt, got: {}".format(type(user_prompt)))
+#     pattern = r"{(.*?)}"
+#     return re.findall(pattern, user_prompt)
 
-def query(model: LLM, 
-          prompt: str, 
-          df: DataFrame, 
-          reorder_columns: bool = True,
-          reorder_rows: bool = True,
-          system_prompt: str = DEFAULT_SYSTEM_PROMPT,
-          ):
+
+# @pandas_udf(StringType(), PandasUDFType.SCALAR)
+# def llm_udf(prompts: pd.Series, *args: pd.Series) -> pd.Series:
+#     """
+#     Enhanced LLM UDF with support for typed fields (text and image).
     
-    fields = get_fields(prompt)
+#     Usage:
+#         SELECT LLM('Given the {text:question} and {image:image_col} give me the answer', 
+#                    question, image_col) as summary 
+#         FROM table
+#     """
+#     model = model_registry.model
+#     if model is None:
+#         raise RuntimeError("Registered model is not initialized.")
     
-    for field in fields:
-        if field not in df.columns:
-            raise ValueError(f"Provided field {field} does not exist in dataframe")
-    
-    if reorder_columns:
-        print("Column reorder : True")
-        fields = get_ordered_columns(df, fields)
-        df = df[fields]
-        #df = df.drop_duplicates(subset=fields)
+#     # Extract the prompt template from the first element
+#     prompt_template = prompts.iloc[0]
+#     typed_fields = parse_typed_fields(prompt_template)
 
-    else:
-        # If reorder_columns is False, filter down to columns that appear in the prompt
-        # but maintain original column order
-        print("Column reorder : False")
-        df = df[fields]
+#     if len(args) != len(typed_fields):
+#         raise ValueError(
+#             f"Expected {len(typed_fields)} column(s) for fields {[f[0] for f in typed_fields]}, "
+#             f"but got {len(args)}."
+#         )
+    
+#     data_dict = {}
+#     for i, (field_name, field_type) in enumerate(typed_fields):
+#         arg = args[i]
+#         if isinstance(arg, pd.DataFrame):
+#             data_dict[field_name] = arg.values.tolist()
+#         elif isinstance(arg, pd.Series):
+#             data_dict[field_name] = arg.tolist()
+#         else:
+#             data_dict[field_name] = list(arg)
 
-    #df.drop_duplicates()
+#     merged_df = pd.DataFrame(data_dict)
+    
+#     # Convert dataframe rows to list of dictionaries
+#     fields_list = merged_df.to_dict('records')
+    
+#     # Execute batch query with image support
+#     outputs = execute_batch_v2_with_images(
+#         model=model,
+#         fields=fields_list,
+#         query=prompt_template,
+#         typed_fields=typed_fields,
+#         system_prompt=DEFAULT_SYSTEM_PROMPT,
+#         guided_choice=["Yes", "No"],
+#         base_url="http://localhost:8000/v1"
+#     )
+    
+#     return pd.Series(outputs)
 
-    if reorder_rows:
-        print("reorder rows ...")
-        df = df.sort_values(by=fields)
-    # Returns a list of dicts, maintaining column order.
-    records = df.to_dict(orient="records")
-    outputs = model.execute_batch_sync(
-        fields=records,
-        query=prompt,
-        system_prompt=system_prompt
-        #guided_choice=["Yes", "No"]
-    )
-    return outputs
+# @pandas_udf(StringType(), PandasUDFType.SCALAR)
+# def llm_udf_embedding(prompts: pd.Series, *args: pd.Series) -> pd.Series:
+#     """
+#     Enhanced LLM UDF with support for typed fields (text and image).
+    
+#     Usage:
+#         SELECT LLM('Given the {text:question} and {image:image_col} give me the answer', 
+#                    question, image_col) as summary 
+#         FROM table
+#     """
+#     # Extract the prompt template from the first element
+#     prompt_template = prompts.iloc[0]
+#     print(prompt_template)
+#     # Parse typed fields from the prompt template
+#     typed_fields = parse_typed_fields(prompt_template)
 
+#     if len(args) != len(typed_fields):
+#         raise ValueError(
+#             f"Expected {len(typed_fields)} column(s) for fields {[f[0] for f in typed_fields]}, "
+#             f"but got {len(args)}."
+#         )
+    
+#     data_dict = {}
+#     for i, (field_name, field_type) in enumerate(typed_fields):
+#         arg = args[i]
+#         if isinstance(arg, pd.DataFrame):
+#             data_dict[field_name] = arg.values.tolist()
+#         elif isinstance(arg, pd.Series):
+#             data_dict[field_name] = arg.tolist()
+#         else:
+#             data_dict[field_name] = list(arg)
 
-def batchQuery(model: LLM, 
-          prompt: str, 
-          df: DataFrame, 
-          system_prompt: str = DEFAULT_SYSTEM_PROMPT,
-          ):
+#     merged_df = pd.DataFrame(data_dict)
     
-
-    records = df.to_dict(orient="records")
-    outputs = model.execute_batch_v2(
-        fields=records,
-        query=prompt,
-        system_prompt=system_prompt
-    )
-    return outputs
-
-from pyspark.sql.functions import udf # Import the standard udf decorator
-
-@pandas_udf(StringType(), PandasUDFType.SCALAR)
-def llm_udf(prompts: pd.Series, *args: pd.Series) -> pd.Series:
-    """
-    Enhanced LLM UDF with support for typed fields (text and image).
+#     # Convert dataframe rows to list of dictionaries
+#     fields_list = merged_df.to_dict('records')
     
-    Usage:
-        SELECT LLM('Given the {text:question} and {image:image_col} give me the answer', 
-                   question, image_col) as summary 
-        FROM table
-    """
-    model = model_registry.model
-    if model is None:
-        raise RuntimeError("Registered model is not initialized.")
+#     # Execute batch query with image support
+#     outputs = execute_batch_v2_with_pruned_embeddings(
+#         model=model,
+#         modelname="/data/models/llava-1.5-7b-hf",
+#         fields=fields_list,
+#         query=prompt_template,
+#         typed_fields=typed_fields,
+#         system_prompt=DEFAULT_SYSTEM_PROMPT,
+#         guided_choice=["Yes", "No"],
+#         base_url="http://localhost:8000/v1"
+#     )
     
-    # Extract the prompt template from the first element
-    prompt_template = prompts.iloc[0]
-    typed_fields = parse_typed_fields(prompt_template)
-
-    if len(args) != len(typed_fields):
-        raise ValueError(
-            f"Expected {len(typed_fields)} column(s) for fields {[f[0] for f in typed_fields]}, "
-            f"but got {len(args)}."
-        )
-    
-    data_dict = {}
-    for i, (field_name, field_type) in enumerate(typed_fields):
-        arg = args[i]
-        if isinstance(arg, pd.DataFrame):
-            data_dict[field_name] = arg.values.tolist()
-        elif isinstance(arg, pd.Series):
-            data_dict[field_name] = arg.tolist()
-        else:
-            data_dict[field_name] = list(arg)
-
-    merged_df = pd.DataFrame(data_dict)
-    
-    # Convert dataframe rows to list of dictionaries
-    fields_list = merged_df.to_dict('records')
-    
-    # Execute batch query with image support
-    outputs = execute_batch_v2_with_images(
-        model=model,
-        fields=fields_list,
-        query=prompt_template,
-        typed_fields=typed_fields,
-        system_prompt=DEFAULT_SYSTEM_PROMPT,
-        guided_choice=["Yes", "No"],
-        base_url="http://localhost:8000/v1"
-    )
-    
-    return pd.Series(outputs)
-
-@pandas_udf(StringType(), PandasUDFType.SCALAR)
-def llm_udf_embedding(prompts: pd.Series, *args: pd.Series) -> pd.Series:
-    """
-    Enhanced LLM UDF with support for typed fields (text and image).
-    
-    Usage:
-        SELECT LLM('Given the {text:question} and {image:image_col} give me the answer', 
-                   question, image_col) as summary 
-        FROM table
-    """
-    modelname = model_registry.model
-    if modelname is None:
-        raise RuntimeError("Registered model is not initialized.")
-    
-    # Extract the prompt template from the first element
-    prompt_template = prompts.iloc[0]
-    print(prompt_template)
-    # Parse typed fields from the prompt template
-    typed_fields = parse_typed_fields(prompt_template)
-
-    if len(args) != len(typed_fields):
-        raise ValueError(
-            f"Expected {len(typed_fields)} column(s) for fields {[f[0] for f in typed_fields]}, "
-            f"but got {len(args)}."
-        )
-    
-    data_dict = {}
-    for i, (field_name, field_type) in enumerate(typed_fields):
-        arg = args[i]
-        if isinstance(arg, pd.DataFrame):
-            data_dict[field_name] = arg.values.tolist()
-        elif isinstance(arg, pd.Series):
-            data_dict[field_name] = arg.tolist()
-        else:
-            data_dict[field_name] = list(arg)
-
-    merged_df = pd.DataFrame(data_dict)
-    
-    # Convert dataframe rows to list of dictionaries
-    fields_list = merged_df.to_dict('records')
-    
-    # Execute batch query with image support
-    outputs = execute_batch_v2_with_pruned_embeddings(
-        model=model,
-        modelname="/data/models/llava-1.5-7b-hf",
-        fields=fields_list,
-        query=prompt_template,
-        typed_fields=typed_fields,
-        system_prompt=DEFAULT_SYSTEM_PROMPT,
-        guided_choice=["Yes", "No"],
-        base_url="http://localhost:8000/v1"
-    )
-    
-    return pd.Series(outputs)
+#     return pd.Series(outputs)

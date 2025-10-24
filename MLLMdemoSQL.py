@@ -4,7 +4,6 @@ import time
 import pandas as pd
 import numpy as np
 from pyspark.sql import SparkSession
-from util.register import *
 from util.utils import *
 from util.cdencoder import *
 import re

@@ -96,47 +96,6 @@ def get_ordered_columns(df: DataFrame, fields: List[str]):
 
     return reordered_fields
 
-def query(model: LLM, 
-          prompt: str, 
-          df: DataFrame, 
-          reorder_columns: bool = True,
-          reorder_rows: bool = True,
-          system_prompt: str = DEFAULT_SYSTEM_PROMPT,
-          ):
-    
-    fields = get_fields(prompt)
-    
-    for field in fields:
-        if field not in df.columns:
-            raise ValueError(f"Provided field {field} does not exist in dataframe")
-    
-    if reorder_columns:
-        print("Column reorder : True")
-        fields = get_ordered_columns(df, fields)
-        df = df[fields]
-    else:
-        # If reorder_columns is False, filter down to columns that appear in the prompt
-        # but maintain original column order
-        print("Column reorder : False")
-        original_columns = df.columns
-        filtered_columns = [column for column in original_columns if column in fields]
-        df = df[filtered_columns]
-    
-    if reorder_rows:
-        print("reorder rows ...")
-        df = df.sort_values(by=fields)
-
-    # Returns a list of dicts, maintaining column order.
-    records = df.to_dict(orient="records")
-    outputs = model.execute_batch(
-        fields=records,
-        query=prompt,
-        system_prompt=system_prompt
-    )
-
-    return outputs
-
-
 def prepend_col_name(df: pd.DataFrame) -> pd.DataFrame:
     # just prepend column name to each value in the column
     df = df.apply(lambda x: x.name + ": " + x.astype(str))
@@ -184,179 +143,179 @@ def parse_typed_fields(prompt_template: str) -> List[Tuple[str, str]]:
 #     return f"data:image/jpeg;base64,{image_base64}"
 
 
-def convert_image_to_base64_url(image_binary) -> str:
-    """
-    Convert binary image data to base64 data URL.
-    Handles both bytes and list/array inputs.
-    """
-    if image_binary is None:
-        return None
+# def convert_image_to_base64_url(image_binary) -> str:
+#     """
+#     Convert binary image data to base64 data URL.
+#     Handles both bytes and list/array inputs.
+#     """
+#     if image_binary is None:
+#         return None
     
-    # Convert list or array to bytes if needed
-    if isinstance(image_binary, list):
-        # If it's a list of integers (byte values), convert to bytes
-        image_binary = bytes(image_binary)
-    elif isinstance(image_binary, np.ndarray):
-        # If it's a numpy array, convert to bytes
-        image_binary = image_binary.tobytes()
-    elif not isinstance(image_binary, bytes):
-        # If it's some other type, try to convert it
-        try:
-            image_binary = bytes(image_binary)
-        except TypeError:
-            raise TypeError(f"Cannot convert {type(image_binary)} to bytes")
+#     # Convert list or array to bytes if needed
+#     if isinstance(image_binary, list):
+#         # If it's a list of integers (byte values), convert to bytes
+#         image_binary = bytes(image_binary)
+#     elif isinstance(image_binary, np.ndarray):
+#         # If it's a numpy array, convert to bytes
+#         image_binary = image_binary.tobytes()
+#     elif not isinstance(image_binary, bytes):
+#         # If it's some other type, try to convert it
+#         try:
+#             image_binary = bytes(image_binary)
+#         except TypeError:
+#             raise TypeError(f"Cannot convert {type(image_binary)} to bytes")
     
     
-    # Now encode to base64
-    image_base64 = base64.b64encode(image_binary).decode('utf-8')
-    return f"data:image/jpeg;base64,{image_base64}"
+#     # Now encode to base64
+#     image_base64 = base64.b64encode(image_binary).decode('utf-8')
+#     return f"data:image/jpeg;base64,{image_base64}"
 
-def post_http_request(
-    model: str,
-    prompts: List[str],
-    temperature: float = 1.0,
-    api_url: str = "http://localhost:8000/v1/chat/completions",
-    guided_choice: List[str] = None,
-    image_urls: List[List[str]] = None,  # Changed: List of lists for multiple images per prompt
-) -> requests.Response:
-    """
-    Send POST request to chat completions endpoint.
+# def post_http_request(
+#     model: str,
+#     prompts: List[str],
+#     temperature: float = 1.0,
+#     api_url: str = "http://localhost:8000/v1/chat/completions",
+#     guided_choice: List[str] = None,
+#     image_urls: List[List[str]] = None,  # Changed: List of lists for multiple images per prompt
+# ) -> requests.Response:
+#     """
+#     Send POST request to chat completions endpoint.
     
-    Args:
-        model: Model name/identifier
-        prompts: List of text prompts
-        temperature: Sampling temperature
-        api_url: API endpoint URL
-        guided_choice: Optional guided choices
-        image_urls: Optional list of image URL lists (one list per prompt)
-    """
-    messages_list = []
+#     Args:
+#         model: Model name/identifier
+#         prompts: List of text prompts
+#         temperature: Sampling temperature
+#         api_url: API endpoint URL
+#         guided_choice: Optional guided choices
+#         image_urls: Optional list of image URL lists (one list per prompt)
+#     """
+#     messages_list = []
     
-    for i, prompt in enumerate(prompts):
-        content = []
+#     for i, prompt in enumerate(prompts):
+#         content = []
         
-        # Add text content
-        content.append({
-            "type": "text",
-            "text": prompt
-        })
+#         # Add text content
+#         content.append({
+#             "type": "text",
+#             "text": prompt
+#         })
         
-        # Add images if provided
-        if image_urls and i < len(image_urls) and image_urls[i]:
-            for img_url in image_urls[i]:
-                if img_url:  # Skip None values
-                    content.append({
-                        "type": "image_url",
-                        "image_url": {
-                            "url": img_url
-                        }
-                    })
+#         # Add images if provided
+#         if image_urls and i < len(image_urls) and image_urls[i]:
+#             for img_url in image_urls[i]:
+#                 if img_url:  # Skip None values
+#                     content.append({
+#                         "type": "image_url",
+#                         "image_url": {
+#                             "url": img_url
+#                         }
+#                     })
         
-        messages_list.append({
-            "role": "user",
-            "content": content
-        })
+#         messages_list.append({
+#             "role": "user",
+#             "content": content
+#         })
     
-    # Construct the payload
-    pload = {
-        "model": model,
-        "messages": messages_list,
-        "temperature": temperature,
-    }
+#     # Construct the payload
+#     pload = {
+#         "model": model,
+#         "messages": messages_list,
+#         "temperature": temperature,
+#     }
     
-    if guided_choice:
-        pload["guided_choice"] = guided_choice
+#     if guided_choice:
+#         pload["guided_choice"] = guided_choice
 
-    headers = {"Content-Type": "application/json"}
+#     headers = {"Content-Type": "application/json"}
 
-    req = requests.Request('POST', api_url, headers=headers, data=json.dumps(pload))
-    prepared = req.prepare()
+#     req = requests.Request('POST', api_url, headers=headers, data=json.dumps(pload))
+#     prepared = req.prepare()
 
-    with requests.Session() as session:
-        response = session.send(prepared)
+#     with requests.Session() as session:
+#         response = session.send(prepared)
 
-    return response
+#     return response
 
-def execute_batch_v2_with_images(
-    model,
-    fields: List[Dict[str, any]],
-    query: str,
-    typed_fields: List[Tuple[str, str]],
-    system_prompt: str = DEFAULT_SYSTEM_PROMPT,
-    guided_choice: List[str] = None,
-    base_url: str = "http://localhost:8000/v1"
-) -> List[str]:
-    """
-    Execute batch queries with support for text and image fields.
+# def execute_batch_v2_with_images(
+#     model,
+#     fields: List[Dict[str, any]],
+#     query: str,
+#     typed_fields: List[Tuple[str, str]],
+#     system_prompt: str = DEFAULT_SYSTEM_PROMPT,
+#     guided_choice: List[str] = None,
+#     base_url: str = "http://localhost:8000/v1"
+# ) -> List[str]:
+#     """
+#     Execute batch queries with support for text and image fields.
     
-    Args:
-        model: The LLM model
-        fields: List of dictionaries containing field values
-        query: The query template with typed placeholders
-        typed_fields: List of (field_name, field_type) tuples
-        system_prompt: System prompt
-        guided_choice: Optional guided choices
-        base_url: API base URL
-    """
-    # Build user prompts and collect image URLs
-    user_prompts = []
-    all_image_urls = []
+#     Args:
+#         model: The LLM model
+#         fields: List of dictionaries containing field values
+#         query: The query template with typed placeholders
+#         typed_fields: List of (field_name, field_type) tuples
+#         system_prompt: System prompt
+#         guided_choice: Optional guided choices
+#         base_url: API base URL
+#     """
+#     # Build user prompts and collect image URLs
+#     user_prompts = []
+#     all_image_urls = []
     
-    for field_dict in fields:
-        # Replace text placeholders in the query
-        user_prompt = query
-        image_urls_for_this_prompt = []
+#     for field_dict in fields:
+#         # Replace text placeholders in the query
+#         user_prompt = query
+#         image_urls_for_this_prompt = []
         
-        for field_name, field_type in typed_fields:
-            placeholder = f"{{{field_type}:{field_name}}}"
+#         for field_name, field_type in typed_fields:
+#             placeholder = f"{{{field_type}:{field_name}}}"
             
-            if field_type == "text":
-                value = field_dict.get(field_name, "")
-                user_prompt = user_prompt.replace(placeholder, str(value))
+#             if field_type == "text":
+#                 value = field_dict.get(field_name, "")
+#                 user_prompt = user_prompt.replace(placeholder, str(value))
             
-            elif field_type == "image":
-                user_prompt = user_prompt.replace(placeholder, "[image]")
-                image_binary = field_dict.get(field_name)[0]
-                if image_binary is not None:
-                    image_url = convert_image_to_base64_url(image_binary)
-                    image_urls_for_this_prompt.append(image_url)
+#             elif field_type == "image":
+#                 user_prompt = user_prompt.replace(placeholder, "[image]")
+#                 image_binary = field_dict.get(field_name)[0]
+#                 if image_binary is not None:
+#                     image_url = convert_image_to_base64_url(image_binary)
+#                     image_urls_for_this_prompt.append(image_url)
         
-        user_prompts.append(user_prompt)
-        all_image_urls.append(image_urls_for_this_prompt if image_urls_for_this_prompt else None)
+#         user_prompts.append(user_prompt)
+#         all_image_urls.append(image_urls_for_this_prompt if image_urls_for_this_prompt else None)
     
-    # Generate full prompts with system prompt
-    prompts = [_generate_prompt(user_prompt=user_prompt, system_prompt=system_prompt) 
-               for user_prompt in user_prompts]
+#     # Generate full prompts with system prompt
+#     prompts = [_generate_prompt(user_prompt=user_prompt, system_prompt=system_prompt) 
+#                for user_prompt in user_prompts]
     
-    outputs = []
-    if base_url:
-        # For each prompt, send a separate HTTP POST request
-        for i, prompt in enumerate(prompts):
-            print(prompt)
-            response = post_http_request(
-                model.model,
-                [prompt],
-                temperature=0,
-                api_url=(base_url + "/chat/completions"),  # Changed endpoint
-                guided_choice=guided_choice,
-                image_urls=[all_image_urls[i]] if all_image_urls[i] else None
-            )
-            request_output = json.loads(response.content)
-            choices = request_output.get('choices', [])
+#     outputs = []
+#     if base_url:
+#         # For each prompt, send a separate HTTP POST request
+#         for i, prompt in enumerate(prompts):
+#             print(prompt)
+#             response = post_http_request(
+#                 model.model,
+#                 [prompt],
+#                 temperature=0,
+#                 api_url=(base_url + "/chat/completions"),  # Changed endpoint
+#                 guided_choice=guided_choice,
+#                 image_urls=[all_image_urls[i]] if all_image_urls[i] else None
+#             )
+#             request_output = json.loads(response.content)
+#             choices = request_output.get('choices', [])
             
-            if choices and 'message' in choices[0] and 'content' in choices[0]['message']:
-                outputs.append(choices[0]['message']['content'])
-            else:
-                outputs.append(None)
+#             if choices and 'message' in choices[0] and 'content' in choices[0]['message']:
+#                 outputs.append(choices[0]['message']['content'])
+#             else:
+#                 outputs.append(None)
         
-        return outputs
-    else:
-        # Use local engine (assuming it supports images)
-        request_outputs = model.engine.generate(
-            prompts=prompts,
-            sampling_params=model.sampling_params
-        )
-        return [output for output in request_outputs]
+#         return outputs
+#     else:
+#         # Use local engine (assuming it supports images)
+#         request_outputs = model.engine.generate(
+#             prompts=prompts,
+#             sampling_params=model.sampling_params
+#         )
+#         return [output for output in request_outputs]
 
 
 # Helper function (placeholder - implement based on your existing code)
@@ -365,39 +324,39 @@ def _generate_prompt(user_prompt: str, system_prompt: str) -> str:
     return f"{system_prompt}\n\n{user_prompt}"
 
 
-def initialize_model_for_pruning(model_path: str):
-    """
-    Initialize the model for pruning on the executor.
-    This loads the vision model on the specified GPU.
-    """
-    import torch
-    import os
-    from transformers import LlavaForConditionalGeneration, AutoProcessor
+# def initialize_model_for_pruning(model_path: str):
+#     """
+#     Initialize the model for pruning on the executor.
+#     This loads the vision model on the specified GPU.
+#     """
+#     import torch
+#     import os
+#     from transformers import LlavaForConditionalGeneration, AutoProcessor
     
-    # Set CUDA device in the worker process
-    os.environ['CUDA_VISIBLE_DEVICES'] = GPU_DEVICES
+#     # Set CUDA device in the worker process
+#     os.environ['CUDA_VISIBLE_DEVICES'] = GPU_DEVICES
     
-    # Force re-initialization of CUDA context
-    torch.cuda.init()
+#     # Force re-initialization of CUDA context
+#     torch.cuda.init()
     
-    print(f"Available GPUs after setting CUDA_VISIBLE_DEVICES: {torch.cuda.device_count()}")
-    print(f"Current CUDA device: {torch.cuda.current_device()}")
+#     print(f"Available GPUs after setting CUDA_VISIBLE_DEVICES: {torch.cuda.device_count()}")
+#     print(f"Current CUDA device: {torch.cuda.current_device()}")
     
-    try:
-        # Load model with CPU first to avoid OOM
-        print(f"Loading model from {model_path}")
-        model = LlavaForConditionalGeneration.from_pretrained(
-            model_path,
-            torch_dtype=torch.float16,
-            low_cpu_mem_usage=True,
-            device_map="auto"  # Automatically distribute across available GPUs
-        )
-        model.eval()
+#     try:
+#         # Load model with CPU first to avoid OOM
+#         print(f"Loading model from {model_path}")
+#         model = LlavaForConditionalGeneration.from_pretrained(
+#             model_path,
+#             torch_dtype=torch.float16,
+#             low_cpu_mem_usage=True,
+#             device_map="auto"  # Automatically distribute across available GPUs
+#         )
+#         model.eval()
         
-        print(f"Model loaded successfully on device: {next(model.parameters()).device}")
+#         print(f"Model loaded successfully on device: {next(model.parameters()).device}")
         
-        return model
+#         return model
         
-    except Exception as e:
-        print(f"Error loading model: {e}")
-        raise
+#     except Exception as e:
+#         print(f"Error loading model: {e}")
+#         raise

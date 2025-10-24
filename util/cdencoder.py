@@ -35,12 +35,10 @@ class CLIPVisionTower(nn.Module):
         self.load_text_tower(device_map)
         self.is_loaded = True
 
-    # [CDPruner] Load text tower for CLIP model
     def load_text_tower(self, device_map=None):
         CLIPVisionModelWithProjection._no_split_modules = ['CLIPEncoderLayer']
         vision_tower_with_projection = CLIPVisionModelWithProjection.from_pretrained(self.vision_tower_name, device_map=device_map)
         self.vision_tower.visual_projection = vision_tower_with_projection.visual_projection
-        print("vision tower name: ", self.vision_tower_name)
         self.text_tokenizer = CLIPTokenizerFast.from_pretrained(self.vision_tower_name)
         self.text_tower = CLIPTextModelWithProjection.from_pretrained(self.vision_tower_name, device_map=device_map)
         self.text_tower.requires_grad_(False)
@@ -57,13 +55,12 @@ class CLIPVisionTower(nn.Module):
             raise ValueError(f'Unexpected select feature: {self.select_feature}')
         return image_features
 
-    # [CDPruner] Get image and text embeds
     @torch.no_grad()
     def forward(self, images, texts=None):
         if type(images) is list:
             image_features = []
             for image in images:
-                image_forward_out = self.vision_tower(image.to(device=self.device, dtype=self.dtype).unsqueeze(0), output_hidden_states=True)
+                image_forward_out = self.vision_tower(image.to(device=self.device, dtype=self.dtype).unsqueeze(0), output_hidden_states=True, output_attentions=True)
                 image_feature = self.feature_select(image_forward_out).to(image.dtype)
                 image_features.append(image_feature)
         else:
@@ -72,7 +69,7 @@ class CLIPVisionTower(nn.Module):
             text_stream = torch.cuda.Stream()
             
             with torch.cuda.stream(image_stream):
-                image_forward_outs = self.vision_tower(images.to(device=self.device, dtype=self.dtype), output_hidden_states=True)
+                image_forward_outs = self.vision_tower(images.to(device=self.device, dtype=self.dtype), output_hidden_states=True, output_attentions=True)
                 image_outputs = self.feature_select(image_forward_outs)
                 image_features = image_outputs.to(images.dtype)
             
