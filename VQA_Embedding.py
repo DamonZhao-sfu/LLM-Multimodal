@@ -92,8 +92,8 @@ def create_llm_udf_with_embeddings():
 
 
 
-def extract_image_binary_from_pope_data(image_data):
-    """Extract image binary from POPE data format."""
+def extract_image_binary_from_vqa_data(image_data):
+    """Extract image binary from VQA data format."""
     if isinstance(image_data, (list, tuple)):
         return image_data[0] if len(image_data) > 0 else image_data
     return image_data
@@ -103,57 +103,64 @@ llm_udf = create_llm_udf_with_embeddings()
 spark.udf.register("LLM", llm_udf)
 
 # Main execution
-start_time = time.time()
+# Read VQA parquet
+VQA_PATH = "/home/haikai/haikai/entropyTest/vqa/validation-00000-of-00068.parquet"
+vqa_df = spark.read.parquet(VQA_PATH)
+vqa_df.createOrReplaceTempView("vqa")
+print(f"Total records: {vqa_df.count()}")
 
-# Read POPE parquet
-POPE_PATH = "/home/haikai/haikai/entropyTest/POPE.parquet"
-pope_df = spark.read.parquet(POPE_PATH)
-pope_df.createOrReplaceTempView("pope")
-print(f"Total records: {pope_df.count()}")
+# Start timing for SQL execution
+start_time = time.time()
 
 # Execute query with proper column references - include all relevant columns
 result_df = spark.sql("""
-    SELECT 
-        id,
-        question_id,
+    SELECT
         question,
-        answer,
-        image_source,
+        multiple_choice_answer,
         LLM('Given the text: {text:question} and image: {image:image} give me the answer to the question', question, image) as predicted
-    FROM pope
+    FROM vqa
 """)
 
-# Normalize both answer and predicted columns for comparison (case-insensitive, trimmed)
+# Add is_correct column: check if multiple_choice_answer is contained in predicted (case-insensitive)
 result_df_with_comparison = result_df.withColumn(
     "is_correct",
     when(
-        lower(trim(col("predicted"))) == lower(trim(col("answer"))),
+        lower(col("predicted")).contains(lower(trim(col("multiple_choice_answer")))),
         1
     ).otherwise(0)
 )
 
-# Write results to CSV
-result_df_with_comparison.coalesce(1).write.mode("overwrite").option("header", "true").csv(output_path)
+# Trigger execution and stop timing
+result_df_with_comparison.cache()
+result_count = result_df_with_comparison.count()
+
 end_time = time.time()
+sql_execution_time = end_time - start_time
+
+print("\n" + "="*60)
+print("SQL EXECUTION TIME (E2E)")
+print("="*60)
+print(f"SQL execution time: {sql_execution_time:.2f} seconds")
+print("="*60)
+
+# Write results to CSV (not included in timing)
+result_df_with_comparison.coalesce(1).write.mode("overwrite").option("header", "true").csv(output_path)
 
 # Calculate and display accuracy
-total_count = result_df_with_comparison.count()
 correct_count = result_df_with_comparison.filter(col("is_correct") == 1).count()
-accuracy = (correct_count / total_count * 100) if total_count > 0 else 0
+accuracy = (correct_count / result_count * 100) if result_count > 0 else 0
 
 print("\n" + "="*60)
 print("PREDICTION ACCURACY RESULTS")
 print("="*60)
-print(f"Total predictions: {total_count}")
+print(f"Total predictions: {result_count}")
 print(f"Correct predictions: {correct_count}")
-print(f"Incorrect predictions: {total_count - correct_count}")
+print(f"Incorrect predictions: {result_count - correct_count}")
 print(f"Accuracy: {accuracy:.2f}%")
 print("="*60)
 
 # Show sample results
 print("\nSample predictions:")
-result_df_with_comparison.select("question", "answer", "predicted", "is_correct").show(10, truncate=False)
-
-print(f"\nTotal execution time: {end_time - start_time:.2f} seconds")
+result_df_with_comparison.select("question", "multiple_choice_answer", "predicted", "is_correct").show(10, truncate=False)
 
 spark.stop()
