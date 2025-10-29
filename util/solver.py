@@ -1,7 +1,7 @@
 import pandas as pd
 from typing import List
 from concurrent.futures import ThreadPoolExecutor
-from trie import Trie
+from util.trie import Trie
 
 
 class Algorithm:

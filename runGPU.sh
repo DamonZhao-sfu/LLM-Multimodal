@@ -1,11 +1,11 @@
 #!/bin/bash
 if [[ "$1" != "" && "$1" -le 8 ]]; then
-    NGPU=$1
+    NGPU=2
 else
     echo "Defaulting to 1 GPU."
-    NGPU=1
+    NGPU=2
 fi
-TIME=$((120-30*$NGPU))
+TIME=$((210-30*$NGPU))
 HOURS=$(($TIME/60))
 MINUTES=$(($TIME%60))
 CORES_PER_GPU=32
