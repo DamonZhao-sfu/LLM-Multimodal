@@ -3,13 +3,10 @@ import json
 from typing import List, Dict, Optional
 import aiohttp
 import asyncio
-import vllm
-from pandas import DataFrame
 from vllm import EngineArgs, LLM as LLMEntrypoint, SamplingParams
 from util.utils import post_http_request, is_server_running, get_tokenizer, async_post_http_request
 from util.prompt import DEFAULT_SYSTEM_PROMPT
 from util.utils import LLM
-import re
 
 class vLLM(LLM):
     def __init__(self, engine_args: EngineArgs, sampling_params: Optional[SamplingParams] = None, base_url: Optional[str] = None):

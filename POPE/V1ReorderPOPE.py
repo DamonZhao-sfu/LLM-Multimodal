@@ -2,17 +2,13 @@ import sys
 import os
 import time
 import pandas as pd
-import numpy as np
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import pandas_udf, PandasUDFType, col, when, lower, trim
+from pyspark.sql.functions import pandas_udf, col, when, lower, trim
 from pyspark.sql.types import StringType
-import torch
-import json
-from typing import Iterator, Tuple
 from util.mllm import *
 from util.utils import *
 from util.cdencoder import *
-from transformers import LlavaForConditionalGeneration, LlavaProcessor, CLIPVisionModel, CLIPImageProcessor
+from util.quick_greedy import *
 
 # Get the absolute path of the project root
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "./"))
@@ -42,7 +38,7 @@ spark = SparkSession.builder \
 API_URL = "http://localhost:8000/v1/chat/completions"
 KEEP_RATIO = 0.5
 RECOVERY_RATIO = 0.0
-MODEL_PATH = "/data/models/llava-1.5-7b-hf"
+MODEL_PATH = "/scratch/hpc-prf-haqc/haikai/hf-cache/llava-1.5-7b-hf"
 
 def create_llm_udf_with_embeddings():    
     @pandas_udf(StringType())
@@ -77,7 +73,7 @@ def create_llm_udf_with_embeddings():
         
         outputs = execute_batch_v2_with_pruned_embeddings(
             #model=model,
-            modelname="/data/models/llava-1.5-7b-hf",
+            modelname="llava-hf/llava-1.5-7b-hf",
             fields=fields_list,
             query=prompt_template,
             typed_fields=typed_fields,
@@ -106,10 +102,37 @@ spark.udf.register("LLM", llm_udf)
 start_time = time.time()
 
 # Read POPE parquet
-POPE_PATH = "/home/haikai/haikai/entropyTest/POPE.parquet"
+
+if not hasattr(pd.DataFrame, 'iteritems'):
+    pd.DataFrame.iteritems = pd.DataFrame.items
+
+POPE_PATH = "/scratch/hpc-prf-haqc/haikai/dataset/POPE/random-00000-of-00001.parquet"
 pope_df = spark.read.parquet(POPE_PATH)
 pope_df.createOrReplaceTempView("pope")
 print(f"Total records: {pope_df.count()}")
+
+algo_begin_time = time.time()
+
+from pyspark.sql.functions import to_json, col
+from pyspark.sql.types import StructType, MapType, ArrayType
+
+for field in pope_df.schema.fields:
+    if isinstance(field.dataType, (StructType, MapType, ArrayType)):
+        pope_df = pope_df.withColumn(field.name, to_json(col(field.name)))
+
+pope_pandas_df = pope_df.toPandas()
+
+pope_pandas_df, _ = QuickGreedy().reorder(
+            pope_pandas_df,
+            early_stop=100000,
+            col_merge=[],
+            one_way_dep=[],
+            distinct_value_threshold=0.7,
+        )
+pope_df = spark.createDataFrame(pope_pandas_df)
+algo_end_time = time.time()
+print(f"\nTotal algo time: {algo_end_time - algo_begin_time:.2f} seconds")
+
 
 # Execute query with proper column references - include all relevant columns
 result_df = spark.sql("""
@@ -149,11 +172,8 @@ print(f"Correct predictions: {correct_count}")
 print(f"Incorrect predictions: {total_count - correct_count}")
 print(f"Accuracy: {accuracy:.2f}%")
 print("="*60)
-
-# Show sample results
-print("\nSample predictions:")
-result_df_with_comparison.select("question", "answer", "predicted", "is_correct").show(10, truncate=False)
-
 print(f"\nTotal execution time: {end_time - start_time:.2f} seconds")
+
+
 
 spark.stop()

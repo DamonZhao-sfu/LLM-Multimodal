@@ -5,91 +5,17 @@ from util.cdencoder import CLIPVisionTower
 from transformers import LlavaForConditionalGeneration, LlavaProcessor, CLIPVisionModel, CLIPImageProcessor
 import time
 import torch
-import numpy as np
 from PIL import Image
 import requests
 import json
 import io
 import base64
-import os
-import csv
-import pandas as pd
 import json
 import time
-from typing import List, Dict, Tuple, Any, Optional
-from datetime import datetime
+from typing import List, Dict, Tuple
 from util.prompt import DEFAULT_SYSTEM_PROMPT
 from util.utils import _generate_prompt
-from threading import Lock
 
-
-# class VisionTowerRegistry:
-#     """Singleton registry for vision tower to ensure it's only loaded once per executor"""
-#     _instance = None
-#     _lock = Lock()
-#     _vision_tower = None
-#     _model = None
-#     _initialized = False
-
-#     def __new__(cls):
-#         if cls._instance is None:
-#             with cls._lock:
-#                 if cls._instance is None:
-#                     cls._instance = super(VisionTowerRegistry, cls).__new__(cls)
-#         return cls._instance
-
-#     def initialize(self, device='cuda:0'):
-#         """Initialize vision tower and projection model once"""
-#         if not self._initialized:
-#             with self._lock:
-#                 if not self._initialized:
-#                     import os
-#                     from util.cdencoder import CLIPVisionTower
-#                     from transformers import LlavaForConditionalGeneration
-                    
-#                     print(f"[VisionTowerRegistry] Initializing vision tower on {device}...")
-                    
-#                     # Set CUDA device
-#                     torch.cuda.set_device(0)
-                    
-#                     # Load vision tower
-#                     vision_tower_name = "/data/models/clip-vit-p14-336/snapshots/ce19dc912ca5cd21c8a653c79e251e808ccabcd1"
-                    
-#                     class MockArgs:
-#                         def __init__(self):
-#                             self.mm_vision_select_layer = -2
-#                             self.mm_vision_select_feature = 'patch'
-                    
-#                     mock_args = MockArgs()
-#                     self._vision_tower = CLIPVisionTower(vision_tower_name, mock_args, delay_load=False)
-#                     self._vision_tower = self._vision_tower.to(device)
-                    
-#                     # Load LLaVA model for projection layer
-#                     MODEL_PATH = "/data/models/llava-1.5-7b-hf"
-#                     self._model = LlavaForConditionalGeneration.from_pretrained(
-#                         MODEL_PATH, 
-#                         torch_dtype=torch.float16, 
-#                         device_map=device,
-#                         attn_implementation="eager"
-#                     )
-                    
-#                     self._initialized = True
-#                     print(f"[VisionTowerRegistry] Vision tower initialized successfully on {self._vision_tower.device}")
-
-#     @property
-#     def vision_tower(self):
-#         if not self._initialized:
-#             self.initialize()
-#         return self._vision_tower
-    
-#     @property
-#     def model(self):
-#         if not self._initialized:
-#             self.initialize()
-#         return self._model
-
-# # Global singleton instance
-# vision_tower_registry = VisionTowerRegistry()
 
 
 import gc
@@ -103,7 +29,7 @@ def load_vision_models(device='cuda:0'):
     torch.cuda.set_device(0)
     
     # Load vision tower
-    vision_tower_name = "/data/models/clip-vit-p14-336/snapshots/ce19dc912ca5cd21c8a653c79e251e808ccabcd1"
+    vision_tower_name = "/scratch/hpc-prf-haqc/haikai/hf-cache/models--openai--clip-vit-large-patch14-336/snapshots/ce19dc912ca5cd21c8a653c79e251e808ccabcd1"
     
     class MockArgs:
         def __init__(self):
@@ -113,9 +39,10 @@ def load_vision_models(device='cuda:0'):
     mock_args = MockArgs()
     vision_tower = CLIPVisionTower(vision_tower_name, mock_args, delay_load=False)
     vision_tower = vision_tower.to(device)
-    
+    vision_tower.vision_tower.config._attn_implementation = "eager"
+    vision_tower.vision_tower.config.output_attentions = True
     # Load LLaVA model for projection layer
-    MODEL_PATH = "/data/models/llava-1.5-7b-hf"
+    MODEL_PATH = "llava-hf/llava-1.5-7b-hf"
     model = LlavaForConditionalGeneration.from_pretrained(
         MODEL_PATH, 
         torch_dtype=torch.float16, 
@@ -223,15 +150,13 @@ def call_vllm_api_with_embeds(image_embedding, question="What's in this image?",
         return None
 
 
-def getOriginalVisualToken(model, image_binary, texts, keep_ratio=0.25, lambda_val=0.1, recovery_ratio=0.1):
+def getOriginalVisualToken(model, vision_tower, image_binary):
     # Load and preprocess image
-    vision_tower = vision_tower_registry.vision_tower
     
     image = Image.open(io.BytesIO(image_binary))
     inputs = vision_tower.image_processor(image, return_tensors="pt")
     images = inputs["pixel_values"]
     image_stream = torch.cuda.Stream()
-    text_stream = torch.cuda.Stream()
     
     model_device = vision_tower.device
     
@@ -247,7 +172,6 @@ def getOriginalVisualToken(model, image_binary, texts, keep_ratio=0.25, lambda_v
       
     torch.cuda.synchronize()
     
-    B, N, C = image_features.shape
     image_features = image_features.to(device=model_device, dtype=torch.float16)
     model.multi_modal_projector = model.multi_modal_projector.to(model_device)
     image_features = model.multi_modal_projector(image_features).detach().cpu()
@@ -388,10 +312,6 @@ def getPrunedVisualTokenVisPruner_optimized(model, vision_tower, image_binary, t
     5. Early termination optimizations
     6. Approximate similarity computation for large token sets
     """
-
-    #vision_tower = vision_tower_registry.vision_tower
-    #model = vision_tower_registry.model
-
     image = Image.open(io.BytesIO(image_binary))
     inputs = vision_tower.image_processor(image, return_tensors="pt")
     images = inputs["pixel_values"]
@@ -568,32 +488,17 @@ def post_http_request_with_embeds(
     guided_choice: List[str] = None,
     image_embeddings: List[torch.Tensor] = None,  # Changed: List of embedding tensors
 ) -> requests.Response:
-    """
-    Send POST request to chat completions endpoint with image embeddings.
-    
-    Args:
-        model: Model name/identifier
-        prompts: List of text prompts
-        temperature: Sampling temperature
-        api_url: API endpoint URL
-        guided_choice: Optional guided choices
-        image_embeddings: Optional list of pruned image embedding tensors
-    """
     messages_list = []
     
     for i, prompt in enumerate(prompts):
         content = []
         
-        # Add text content
         content.append({
             "type": "text",
             "text": prompt
         })
         
-        # Add image embeddings if provided
         if image_embeddings and i < len(image_embeddings) and image_embeddings[i] is not None:
-            # Convert tensor to list for JSON serialization
-
             embedding_data = image_embeddings[i]
             embedding = encode_image_embedding_to_base64(embedding_data)
             content.append({
@@ -606,14 +511,13 @@ def post_http_request_with_embeds(
             "content": content
         })
     
-    # Construct the payload
     pload = {
         "model": model,
         "messages": messages_list,
         "temperature": temperature,
     }
-    if guided_choice:
-        pload["guided_choice"] = guided_choice
+    if guided_choice is not None and len(guided_choice) > 0:
+        pload["structured_outputs"] = {"choice": guided_choice}
 
     headers = {"Content-Type": "application/json"}
     req = requests.Request('POST', api_url, headers=headers, data=json.dumps(pload))
@@ -628,10 +532,11 @@ def execute_batch_v2_with_pruned_embeddings(
     modelname,
     fields: List[Dict[str, any]],
     query: str,
+    keep_ratio: float,
     typed_fields: List[Tuple[str, str]],
     system_prompt: str = DEFAULT_SYSTEM_PROMPT,
     guided_choice: List[str] = None,
-    base_url: str = "http://localhost:8000/v1"
+    base_url: str = "http://localhost:8000/v1",
 ) -> List[str]:
     """
     Execute batch queries with pruned image embeddings.
@@ -663,13 +568,20 @@ def execute_batch_v2_with_pruned_embeddings(
                     if image_data is not None:
                         image_binary = extract_image_binary_from_pope_data(image_data)
                         
-                        # Generate pruned embeddings
-                        reduced_tokens = getPrunedVisualTokenVisPruner_optimized(
-                            model,
-                            vision_tower,
-                            image_binary,
-                            user_prompt
-                        )
+                        if keep_ratio == 1:
+                            reduced_tokens = getOriginalVisualToken(
+                                model,
+                                vision_tower,
+                                image_binary
+                            )
+                        else:
+                            reduced_tokens = getPrunedVisualTokenVisPruner_optimized(
+                                model,
+                                vision_tower,
+                                image_binary,
+                                user_prompt,
+                                keep_ratio=keep_ratio
+                            )
                         
                         pruned_embeddings_for_this_prompt.append(reduced_tokens.to(torch.float16))
             
@@ -708,115 +620,6 @@ def execute_batch_v2_with_pruned_embeddings(
     finally:
         # Always clean up models, even if an error occurred
         cleanup_vision_models(vision_tower, model)
-
-
-# def execute_batch_v2_with_pruned_embeddings(
-#     #model,
-#     modelname,
-#     fields: List[Dict[str, any]],
-#     query: str,
-#     typed_fields: List[Tuple[str, str]],
-#     system_prompt: str = DEFAULT_SYSTEM_PROMPT,
-#     guided_choice: List[str] = None,
-#     base_url: str = "http://localhost:8000/v1",
-#     keep_ratio: float = 0.5,
-#     recovery_ratio: float = 0.0
-# ) -> List[str]:
-#     """
-#     Execute batch queries with pruned image embeddings.
-    
-#     Args:
-#         model: The LLM model (used for pruning)
-#         fields: List of dictionaries containing field values
-#         query: The query template with typed placeholders
-#         typed_fields: List of (field_name, field_type) tuples
-#         system_prompt: System prompt
-#         guided_choice: Optional guided choices
-#         base_url: API base URL
-#         keep_ratio: Ratio of tokens to keep during pruning
-#         recovery_ratio: Ratio of tokens to recover
-#     """
-#     # Build user prompts and generate pruned embeddings
-#     model = vision_tower_registry.model
-
-#     user_prompts = []
-#     all_pruned_embeddings = []
-    
-#     for field_dict in fields:
-#         # Replace text placeholders in the query
-#         user_prompt = query
-#         pruned_embeddings_for_this_prompt = []
-        
-#         for field_name, field_type in typed_fields:
-#             placeholder = f"{{{field_type}:{field_name}}}"
-            
-#             if field_type == "text":
-#                 value = field_dict.get(field_name, "")
-#                 user_prompt = user_prompt.replace(placeholder, str(value))
-            
-#             elif field_type == "image":
-#                 user_prompt = user_prompt.replace(placeholder, "[image]")
-#                 image_data = field_dict.get(field_name)
-                
-#                 if image_data is not None:
-#                     # Extract image binary
-#                     image_binary = extract_image_binary_from_pope_data(image_data)
-                    
-#                     # Generate pruned embeddings
-#                     embed_start = time.time()
-#                     # reduced_tokens = getOriginalVisualToken(
-#                     #     model,
-#                     #     image_binary,
-#                     #     user_prompt
-#                     # )
-#                     reduced_tokens = getPrunedVisualTokenVisPruner_optimized(
-#                         model,
-#                         image_binary,
-#                         user_prompt,  # Use the current prompt as question
-#                         keep_ratio=keep_ratio,
-#                         important_ratio=0.6,
-#                         recovery_ratio=recovery_ratio
-#                     )
-#                     embed_end = time.time()
-
-#                     # Convert to float16 for efficiency
-#                     pruned_embeddings_for_this_prompt.append(reduced_tokens.to(torch.float16))
-        
-#         user_prompts.append(user_prompt)
-#         all_pruned_embeddings.append(
-#             pruned_embeddings_for_this_prompt[0] if pruned_embeddings_for_this_prompt else None
-#         )
-    
-#     # Generate full prompts with system prompt
-#     prompts = [_generate_prompt(user_prompt=user_prompt, system_prompt=system_prompt) 
-#                for user_prompt in user_prompts]
-    
-#     outputs = []
-#     if base_url:
-#         # For each prompt, send a separate HTTP POST request with embeddings
-#         for i, prompt in enumerate(prompts):
-
-#             api_start = time.time()
-#             response = post_http_request_with_embeds(
-#                 modelname,
-#                 [prompt],
-#                 temperature=0,
-#                 api_url=(base_url + "/chat/completions"),
-#                 guided_choice=guided_choice,
-#                 image_embeddings=[all_pruned_embeddings[i]] if all_pruned_embeddings[i] is not None else None
-#             )
-#             api_end = time.time()
-                        
-#             request_output = json.loads(response.content)
-#             choices = request_output.get('choices', [])
-            
-#             if choices and 'message' in choices[0] and 'content' in choices[0]['message']:
-#                 outputs.append(choices[0]['message']['content'])
-#             else:
-#                 outputs.append(None)
-        
-#         return outputs
-
 
 # Helper function to extract image binary (you'll need to implement this based on your data format)
 def extract_image_binary_from_pope_data(image_data):
