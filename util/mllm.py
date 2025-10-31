@@ -27,9 +27,11 @@ def load_vision_models(device='cuda:0'):
     
     # Set CUDA device
     torch.cuda.set_device(0)
-    
+    vision_tower_name = "/data/models/clip-vit-p14-336/snapshots/ce19dc912ca5cd21c8a653c79e251e808ccabcd1"  # Default CLIP model
+    MODEL_PATH = "/data/models/llava-1.5-7b-hf"
+
     # Load vision tower
-    vision_tower_name = "/scratch/hpc-prf-haqc/haikai/hf-cache/models--openai--clip-vit-large-patch14-336/snapshots/ce19dc912ca5cd21c8a653c79e251e808ccabcd1"
+    #vision_tower_name = "/scratch/hpc-prf-haqc/haikai/hf-cache/models--openai--clip-vit-large-patch14-336/snapshots/ce19dc912ca5cd21c8a653c79e251e808ccabcd1"
     
     class MockArgs:
         def __init__(self):
@@ -42,7 +44,6 @@ def load_vision_models(device='cuda:0'):
     vision_tower.vision_tower.config._attn_implementation = "eager"
     vision_tower.vision_tower.config.output_attentions = True
     # Load LLaVA model for projection layer
-    MODEL_PATH = "llava-hf/llava-1.5-7b-hf"
     model = LlavaForConditionalGeneration.from_pretrained(
         MODEL_PATH, 
         torch_dtype=torch.float16, 

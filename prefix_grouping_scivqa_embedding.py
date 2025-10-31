@@ -5,6 +5,7 @@ import pandas as pd
 import torch
 from typing import Dict, List, Tuple, Any
 from pyspark.sql import SparkSession
+from pyspark.sql.functions import regexp_replace, col, when, lower, trim
 from pyspark.sql.functions import pandas_udf, col, when, lower, trim
 from pyspark.sql.types import StringType
 from util.mllm import *
@@ -38,14 +39,79 @@ spark = SparkSession.builder \
 API_URL = "http://localhost:8000/v1/chat/completions"
 RECOVERY_RATIO = 0.0
 
-def extract_image_binary_from_pope_data(image_data):
-    """Extract image binary from POPE data format."""
-    if isinstance(image_data, dict):
-        return image_data['bytes']
-    if isinstance(image_data, (list, tuple)):
-        return image_data[0] if len(image_data) > 0 else image_data
-    return image_data
+full_system_prompt = '''You are an expert scientific figure analyst specializing in academic publications.
+Your task is to answer questions about scientific figures and their captions accurately and concisely.
+Answer the given question based *solely* on the information visible in the figure and its provided caption.
 
+The user message will include a 'Question Type'. Adhere strictly to the following rules for formatting your response based on the question type:
+
+- For 'closed-ended finite answer set binary visual' or 'closed-ended finite answer set binary non-visual': 
+  - Respond ONLY with 'Yes' or 'No'. 
+  - Do NOT add any other text, explanations, or punctuation.
+  - Your entire response must be exactly one word: either 'Yes' or 'No'.
+
+- For 'closed-ended finite answer set non-binary visual' or 'closed-ended finite answer set non-binary non-visual': 
+  - Identify the correct option(s) from the provided 'Answer Options'.
+  - Respond ONLY with the letter(s) of the correct option(s) as listed.
+  - For a single correct option, provide only its letter (e.g., 'B').
+  - For multiple correct options, list ALL correct letters separated by commas with NO SPACES (e.g., 'A,C,D').
+  - Ensure ALL correct options are listed and NO incorrect ones.
+  - Do NOT add any other text, explanations, or surrounding punctuation.
+
+- For 'closed-ended infinite answer set visual' or 'closed-ended infinite answer set non-visual': 
+  - Provide a brief, direct answer.
+  - This answer must be a value, a short phrase, a specific name, a label, or a list of values read directly from the figure or caption.
+  - **For numerical values:** Read values as precisely as possible from the graph axes, data points, or labels. Include units ONLY if they appear in the figure.
+  - **For non-numerical values:** Reproduce them EXACTLY as they appear in the figure or caption.
+  - Do NOT add any introductory phrases, explanations, or surrounding text.
+
+- For 'unanswerable': 
+  - Respond ONLY with the exact phrase: 'It is not possible to answer this question based only on the provided data.'
+  - Do NOT add any other text.
+
+IMPORTANT: Your response should ONLY contain the answer in the correct format as specified above - nothing else.
+Do NOT include any additional text, explanations, comments, or contextual information.
+Your answer must be based solely on the information visible in the figure and its provided caption.
+
+Below are examples of questions and answers similar to what you will receive. "
+                "Study these examples carefully to understand the expected answer format. "
+                "Your question will be in the user message after these examples:
+
+Example 1:
+Question: What is the approximate value of the red line at x=5?
+Image: xxx.jpg
+Caption: Figure 3: R10@1 for different ranges on E-commerce.
+QA Type: closed-ended infinite answer set visual
+Answer Options: []
+Answer: 0.66
+
+Example 2:
+Question: Is the value of the red line higher than the value of the blue line at the cut range of 6?
+QA Type: closed-ended finite answer set binary visual
+Answer Options: []
+Answer: Yes
+
+Example 3:
+Question: Which line represents the R10@1 metric?
+QA Type: closed-ended finite answer set binary visual
+Answer Options: [{"A": "The red line"}, {"B": "The blue line"}, {"C": null}, {"D": null}]
+Answer: B
+
+Example 4:
+Question: What is the exact temperature shown in the image?
+QA Type: unanswerable
+Answer Options: []
+Answer: It is not possible to answer this question based only on the provided data.
+
+
+Please only return the Answer field without other field such as Question, QA Type.
+
+'''
+
+def extract_image_binary_from_pope_data(image_path):
+    with open("/home/haikai/images_train/" + image_path, 'rb') as image_file:
+        binary_data = image_file.read()
+    return binary_data
 
 def preprocess_and_cache_pruned_embeddings(
     df: pd.DataFrame,
@@ -90,9 +156,9 @@ def preprocess_and_cache_pruned_embeddings(
             
             try:
                 # Get image data (same for all rows with this image_id)
-                image_data = image_group.iloc[0][image_column]
+                image_path = image_group.iloc[0][image_column]
                 # Extract image binary
-                image_binary = extract_image_binary_from_pope_data(image_data)
+                image_binary = extract_image_binary_from_pope_data(image_path)
                 
                 # Collect all questions for this image
                 all_questions = image_group[question_column].tolist()
@@ -200,6 +266,19 @@ def inference_with_cached_embeddings(
         for field_name, field_type in typed_fields:
             placeholder = f"{{{field_type}:{field_name}}}"
             
+            if field_name == "qa_pair_type":
+                qa_pair_type = field_dict.get(field_name, "")
+                answer_options = field_dict.get("answer_options", [])
+                if qa_pair_type in ["closed-ended finite answer set binary visual", "closed-ended finite answer set binary non-visual"]:
+                    system_prompt += "\n\nREMEMBER: Your entire answer must be EXACTLY 'Yes' or 'No' - nothing more, nothing less."
+                elif qa_pair_type in ["closed-ended finite answer set non-binary visual", "closed-ended finite answer set non-binary non-visual"] and len(answer_options) == 4:
+                    system_prompt += "\n\nREMEMBER: Your entire answer must be ONLY the letter(s) of the correct option(s) - e.g., 'A' or 'B,D'."
+                elif qa_pair_type in ["closed-ended infinite answer set visual", "closed-ended infinite answer set non-visual"]:
+                    system_prompt += "\n\nREMEMBER: Your answer must be concise and direct, with no explanatory text."
+                elif qa_pair_type == "unanswerable":
+                    system_prompt += "\n\nREMEMBER: Decide if the question is unanswerable based on the figure and caption. If it is, respond with 'It is not possible to answer this question based only on the provided data.'. If it is not, respond with the correct answer."
+
+
             if field_type == "text":
                 value = field_dict.get(field_name, "")
                 user_prompt = user_prompt.replace(placeholder, str(value))
@@ -219,7 +298,7 @@ def inference_with_cached_embeddings(
     
     # Generate full prompts
     prompts = [
-        _generate_prompt(user_prompt=user_prompt, system_prompt=system_prompt)
+        _generate_prompt(user_prompt=user_prompt, system_prompt=full_system_prompt)
         for user_prompt in user_prompts
     ]
     
@@ -253,11 +332,8 @@ def create_llm_udf_with_cached_embeddings(embedding_cache: Dict[str, Dict], imag
         prompts: pd.Series,
         *args: pd.Series
     ) -> pd.Series:
-        prompt_template = prompts.iloc[0]
-        print(f"Processing batch on PID {os.getpid()} with cached embeddings")
-        
+        prompt_template = prompts.iloc[0]        
         typed_fields = parse_typed_fields(prompt_template)
-        
         if len(args) != len(typed_fields):
             raise ValueError(
                 f"Expected {len(typed_fields)} column(s) for fields {[f[0] for f in typed_fields]}, "
@@ -284,7 +360,7 @@ def create_llm_udf_with_cached_embeddings(embedding_cache: Dict[str, Dict], imag
             typed_fields=typed_fields,
             embedding_cache=embedding_cache,
             image_source_mapping=image_source_mapping,
-            system_prompt=DEFAULT_SYSTEM_PROMPT,
+            system_prompt=full_system_prompt,
             base_url="http://localhost:8000/v1"
         )
         
@@ -309,16 +385,16 @@ def run_experiment_with_cached_embeddings(
     print(f"Preprocessing images with keep_ratio={keep_ratio}...")
     embedding_cache = preprocess_and_cache_pruned_embeddings(
         df=pope_pandas_df,
-        image_column='image',
+        image_column='image_file',
         question_column='question',
-        image_id_column='image_id',
+        image_id_column='figure_id',
         keep_ratio=keep_ratio,
         device='cuda:0'
     )
     
     # Create image source mapping
     image_source_mapping_reordered = {
-        idx: row['image_id'] 
+        idx: row['figure_id'] 
         for idx, row in pope_pandas_df.iterrows()
     }
     
@@ -331,17 +407,30 @@ def run_experiment_with_cached_embeddings(
     
     # Execute query
     result_df = spark.sql("""
-        SELECT 
-            multiple_choice_answer,
-            LLM('Given the text: {text:question} and candidate answers {text:answers} and image: {image:image}, give me the answer to the question', question, answers, image) as predicted
-        FROM pope
-    """)
+    SELECT 
+        answer,
+        LLM('
+qa_pair_type: {text:qa_pair_type}
+answer_options: {text:answer_options}
+image_file: {image:image_file}
+question: {text:question}
+caption: {text:caption}
+figure_type: {text:figure_type}
+
+
+', question, image_file, caption, figure_type, qa_pair_type, answer_options) as predicted
+    FROM pope
+""")
     
-    # Add comparison column
+    result_df = result_df.withColumn(
+        "predicted",
+        regexp_replace(regexp_replace(col("predicted"), "[\r\n]+", " "), "\\s+", " ")
+    )
+
     result_df_with_comparison = result_df.withColumn(
     "is_correct",
     when(
-        lower(col("predicted")).contains(lower(trim(col("multiple_choice_answer")))),
+        lower(col("predicted")).contains(lower(trim(col("answer")))),
         1
     ).otherwise(0))
     
@@ -404,16 +493,20 @@ def calculate_accuracy(csv_path: str, keep_ratio: float) -> float:
 
 # Main execution
 if __name__ == "__main__":
-    keep_ratios = [0.056, 0.111, 0.222]
-    dataset_name = "VQA_image_prefix"
+    keep_ratios = [0.056]
+    dataset_name = "SciVQA_image_prefix"
     
     overall_start = time.time()
     
     # Read POPE parquet once
-    POPE_PATH = "/scratch/hpc-prf-haqc/haikai/dataset/VQAv2/validation-00000-of-00068.parquet"
-    pope_df = spark.read.parquet(POPE_PATH)
+    POPE_PATH = "/home/haikai/train_2025-07-03_09-06.json"
+    pope_df = spark.read \
+        .option("multiLine", "true") \
+        .option("encoding", "UTF-8") \
+        .json(POPE_PATH) \
+        .limit(300) \
+        .cache()
     pope_df.createOrReplaceTempView("pope")
-    print(f"Total records: {pope_df.count()}")
     
     # Convert to pandas once
     pope_pandas_df = pope_df.toPandas()
@@ -433,13 +526,12 @@ if __name__ == "__main__":
         execution_times[keep_ratio] = exec_time
         
         # Calculate accuracy
-        accuracy = calculate_accuracy(output_path, keep_ratio)
+        accuracy = 0
         results[keep_ratio] = accuracy
         
         # Clear GPU memory between experiments
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-            print("GPU cache cleared")
     
     overall_end = time.time()
     overall_time = overall_end - overall_start
