@@ -3,7 +3,7 @@ import os
 import time
 import pandas as pd
 import torch
-from typing import Dict, List, Tuple, Any
+from typing import Dict, List, Tuple, Any, Callable
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import regexp_replace, col, when, lower, trim
 from pyspark.sql.functions import pandas_udf, col, when, lower, trim
@@ -12,6 +12,7 @@ from util.mllm import *
 from util.utils import *
 from util.cdencoder import *
 from util.utils import _generate_prompt
+from util.quick_greedy import *
 
 # Get the absolute path of the project root
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "./"))
@@ -249,6 +250,7 @@ def inference_with_cached_embeddings(
     typed_fields: List[Tuple[str, str]],
     embedding_cache: Dict[str, Dict],
     image_source_mapping: Dict[int, str],
+    reordered_columns: List[str],  # NEW: List of columns in reordered sequence
     system_prompt: str = DEFAULT_SYSTEM_PROMPT,
     guided_choice: List[str] = None,
     base_url: str = "http://localhost:8000/v1",
@@ -258,14 +260,25 @@ def inference_with_cached_embeddings(
     
     # Build prompts and retrieve cached embeddings
     for idx, field_dict in enumerate(fields):
-        user_prompt = query
+        # Initialize prompt with empty string - we'll build it from scratch
+        user_prompt = ""
         pruned_embedding = None
         
         image_source = image_source_mapping.get(idx)
         
-        for field_name, field_type in typed_fields:
-            placeholder = f"{{{field_type}:{field_name}}}"
+        # Build prompt following the REORDERED column sequence
+        for field_name in reordered_columns:
+            # Find the field type for this field name
+            field_type = None
+            for fname, ftype in typed_fields:
+                if fname == field_name:
+                    field_type = ftype
+                    break
             
+            if field_type is None:
+                continue  # Skip if field not found in typed_fields
+            
+            # Handle special system prompt modifications for qa_pair_type
             if field_name == "qa_pair_type":
                 qa_pair_type = field_dict.get(field_name, "")
                 answer_options = field_dict.get("answer_options", [])
@@ -277,23 +290,23 @@ def inference_with_cached_embeddings(
                     system_prompt += "\n\nREMEMBER: Your answer must be concise and direct, with no explanatory text."
                 elif qa_pair_type == "unanswerable":
                     system_prompt += "\n\nREMEMBER: Decide if the question is unanswerable based on the figure and caption. If it is, respond with 'It is not possible to answer this question based only on the provided data.'. If it is not, respond with the correct answer."
-
-
+            
+            # Build the prompt line by line following reordered sequence
             if field_type == "text":
                 value = field_dict.get(field_name, "")
-                user_prompt = user_prompt.replace(placeholder, str(value))
+                user_prompt += f"{field_name}: {value}\n"
             
             elif field_type == "image":
-                user_prompt = user_prompt.replace(placeholder, "[image]")
+                user_prompt += f"{field_name}: [image]\n"
                 
-                # Retrieve cached embedding instead of processing image
+                # Retrieve cached embedding
                 if image_source and image_source in embedding_cache:
                     pruned_embedding = embedding_cache[image_source]['embedding']
                 else:
                     print(f"Warning: No cached embedding found for image_id: {image_source}")
                     pruned_embedding = None
         
-        user_prompts.append(user_prompt)
+        user_prompts.append(user_prompt.strip())  # Remove trailing newline
         all_pruned_embeddings.append(pruned_embedding)
     
     # Generate full prompts
@@ -326,7 +339,20 @@ def inference_with_cached_embeddings(
     return outputs
 
 
-def create_llm_udf_with_cached_embeddings(embedding_cache: Dict[str, Dict], image_source_mapping: Dict[int, str]):
+def create_llm_udf_with_cached_embeddings(
+    embedding_cache: Dict[str, Dict], 
+    image_source_mapping: Dict[int, str],
+    reorder_function: Callable[[pd.DataFrame], Tuple[pd.DataFrame, List[str]]] = None  # NEW parameter
+):
+    """
+    Create UDF with optional reordering function.
+    
+    Args:
+        embedding_cache: Cache of pruned embeddings
+        image_source_mapping: Mapping from indices to image IDs
+        reorder_function: Optional function that takes a DataFrame and returns 
+                         (reordered_df, column_order_list)
+    """
     @pandas_udf(StringType())
     def llm_udf_cached_embeddings(
         prompts: pd.Series,
@@ -340,6 +366,7 @@ def create_llm_udf_with_cached_embeddings(embedding_cache: Dict[str, Dict], imag
                 f"but got {len(args)}."
             )
         
+        # Build initial data dictionary
         data_dict = {}
         for i, (field_name, field_type) in enumerate(typed_fields):
             arg = args[i]
@@ -350,7 +377,25 @@ def create_llm_udf_with_cached_embeddings(embedding_cache: Dict[str, Dict], imag
             else:
                 data_dict[field_name] = list(arg)
         
+        # Create DataFrame
         merged_df = pd.DataFrame(data_dict)
+        
+        # Apply reordering if function is provided
+        if reorder_function is not None:
+            print(f"\n🔄 Applying reorder function to DataFrame with shape {merged_df.shape}")
+            print(f"Original column order: {list(merged_df.columns)}")
+            
+            reordered_df, reordered_columns = reorder_function(merged_df)
+            
+            print(f"Reordered column order: {reordered_columns}")
+            print(f"Reordered DataFrame shape: {reordered_df.shape}")
+            
+            merged_df = reordered_df
+        else:
+            # If no reordering, maintain original column order
+            reordered_columns = list(merged_df.columns)
+        
+        # Convert to records for processing
         fields_list = merged_df.to_dict('records')
 
         outputs = inference_with_cached_embeddings(
@@ -360,6 +405,7 @@ def create_llm_udf_with_cached_embeddings(embedding_cache: Dict[str, Dict], imag
             typed_fields=typed_fields,
             embedding_cache=embedding_cache,
             image_source_mapping=image_source_mapping,
+            reordered_columns=reordered_columns,  # Pass the reordered column sequence
             system_prompt=full_system_prompt,
             base_url="http://localhost:8000/v1"
         )
@@ -368,11 +414,65 @@ def create_llm_udf_with_cached_embeddings(embedding_cache: Dict[str, Dict], imag
     
     return llm_udf_cached_embeddings
 
+
+def example_reorder_function(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
+    """
+    Example reordering function using QuickGreedy algorithm.
+    SIMPLIFIED VERSION: Only reorders columns, preserves row order and original data types.
+    
+    Args:
+        df: Input DataFrame with columns like question, image_file, caption, etc.
+    
+    Returns:
+        Tuple of (reordered_df, column_order_list)
+    """
+    # Convert unhashable types (lists, arrays) to strings for reordering
+    df_for_reorder = df.copy()
+    unhashable_cols = []
+    
+    # Identify columns with unhashable types and convert them
+    for col in df_for_reorder.columns:
+        try:
+            # Try to check if column is hashable
+            df_for_reorder[col].nunique()
+        except TypeError:
+            # If TypeError occurs, convert to string representation
+            unhashable_cols.append(col)
+            df_for_reorder[col] = df_for_reorder[col].apply(
+                lambda x: str(x) if isinstance(x, (list, dict, np.ndarray)) else x
+            )
+    
+    # Perform reordering on the string-converted DataFrame
+    reordered_df_temp, _ = QuickGreedy().reorder(
+        df_for_reorder,
+        early_stop=100000,
+        col_merge=[],
+        one_way_dep=[],
+        distinct_value_threshold=0.7,
+    )
+    
+    # Extract the column order from the reordered dataframe
+    final_column_order = list(reordered_df_temp.columns)
+    
+    # Apply the same column order to the ORIGINAL dataframe (preserving data types)
+    # But also apply the row reordering
+    reordered_df_original = df_for_reorder[final_column_order].copy()
+    
+    # Restore original data types for unhashable columns
+    for col in unhashable_cols:
+        if col in final_column_order:
+            reordered_df_original[col] = df[col].values
+    
+    return reordered_df_original, final_column_order
+
+
+
 def run_experiment_with_cached_embeddings(
     keep_ratio: float,
     pope_pandas_df: pd.DataFrame,
     pope_spark_df,
-    dataset_name: str = "POPE_image_prefix"
+    dataset_name: str = "POPE_image_prefix",
+    reorder_function: Callable[[pd.DataFrame], Tuple[pd.DataFrame, List[str]]] = None  # NEW parameter
 ) -> Tuple[str, float]:
     """Run experiment with cached embeddings for a specific keep_ratio."""
     print(f"\n{'='*80}")
@@ -398,10 +498,11 @@ def run_experiment_with_cached_embeddings(
         for idx, row in pope_pandas_df.iterrows()
     }
     
-    # Create and register UDF
+    # Create and register UDF with reordering function
     llm_udf = create_llm_udf_with_cached_embeddings(
         embedding_cache, 
-        image_source_mapping_reordered
+        image_source_mapping_reordered,
+        reorder_function=reorder_function  # Pass the reordering function
     )
     spark.udf.register("LLM", llm_udf)
     
@@ -491,8 +592,8 @@ def calculate_accuracy(csv_path: str, keep_ratio: float) -> float:
 
 # Main execution
 if __name__ == "__main__":
-    keep_ratios = [1, 0.222,0.111,0.056]
-    dataset_name = "SciVQA_image_prefix"
+    keep_ratios = [1, 0.222, 0.111, 0.056]
+    dataset_name = "SciVQA_image_prefix_reorder_grouping"
     
     overall_start = time.time()
     
@@ -518,7 +619,8 @@ if __name__ == "__main__":
             keep_ratio=keep_ratio,
             pope_pandas_df=pope_pandas_df,
             pope_spark_df=pope_df,
-            dataset_name=dataset_name
+            dataset_name=dataset_name,
+            reorder_function=example_reorder_function  # Pass your reorder function here
         )
         
         execution_times[keep_ratio] = exec_time
