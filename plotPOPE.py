@@ -4,13 +4,13 @@ import pandas as pd
 
 # Data
 data = {
-    'Datasets': ['SciVQA']*16,
-    'Total Executi Accuracy': [323.65, 296.35, 296.23, 274.6, 267.81, 283.23, 237.47, 246.79, 
-                                209.82, 87.31, 87.8, 88.93, 133.32, 70.29, 90.5, 78.22],
+    'Datasets': ['POPE']*16,
+    'Total Executi Accuracy': [487.51, 469.85, 385.52, 360.62,  525.65, 532.14, 447.49, 424.25,  
+                                401.43, 215.68, 180.32, 165.93,  455.19,  250.39,  218.54, 200.79],
     'Token Preserve Percentage': ['100%', '22.2%', '11.1%', '5.6%', '100%', '22.2%', '11.1%', '5.6%',
                                    '100%', '22.2%', '11.1%', '5.6%', '100%', '22.2%', '11.1%', '5.6%'],
-    'Accuracy': [60, 58, 60, 57, 49, 49, 52, 50, 56, 48, 48, 47, 28, 31, 28, 29],
-    'Strategy': ['Pruned']*4 + ['Pruned + V1']*4 + ['Pruned+Grouping']*4 + ['Pruned+Grouping+V1']*4
+    'Accuracy': [78.27, 78.87, 77.23,74.47, 79.20, 79.60, 76.60, 72.9, 82.23, 80.43, 76.3, 69.2, 79.2, 79.5, 74.6, 64.7],
+    'Strategy': ['Pruned']*4 + ['Pruned + V1']*4 + ['Pruned+Grouping']*4 + ['Pruned+V1+Grouping']*4
 }
 
 df = pd.DataFrame(data)
@@ -55,7 +55,7 @@ for i, strategy in enumerate(strategies):
 
 ax2.set_xlabel('Token Preserve Percentage', fontsize=12, fontweight='bold')
 ax2.set_ylabel('Accuracy (%)', fontsize=12, fontweight='bold')
-ax2.set_title('Accuracy vs Token Preserve Percentage of SciVQA dataset', fontsize=14, fontweight='bold')
+ax2.set_title('Accuracy vs Token Preserve Percentage of POPE dataset', fontsize=14, fontweight='bold')
 ax2.set_xticks(token_percentages)
 ax2.set_xticklabels([f'{int(p)}%' for p in token_percentages])
 ax2.legend(loc='best')
@@ -64,4 +64,4 @@ ax2.invert_xaxis()  # So 100% is on the left
 
 plt.tight_layout()
 plt.show()
-plt.savefig("scivqa.png")
+plt.savefig("pope.png")

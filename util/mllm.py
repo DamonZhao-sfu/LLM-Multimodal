@@ -304,15 +304,6 @@ def similarity_based_duplicate_removal_fast(features, num_to_keep):
 
 def getPrunedVisualTokenVisPruner_optimized(model, vision_tower, image_binary, texts, keep_ratio=0.125, 
                                           important_ratio=0.6, recovery_ratio=0.1, text_guidance_weight=0.5):
-    """
-    Highly optimized version of VisPruner with multiple speedup techniques:
-    1. Minimized GPU-CPU transfers
-    2. In-place operations where possible  
-    3. Vectorized operations
-    4. Memory-efficient tensor operations
-    5. Early termination optimizations
-    6. Approximate similarity computation for large token sets
-    """
     image = Image.open(io.BytesIO(image_binary))
     inputs = vision_tower.image_processor(image, return_tensors="pt")
     images = inputs["pixel_values"]
@@ -402,28 +393,6 @@ def getPrunedVisualTokenVisPruner_optimized(model, vision_tower, image_binary, t
                     
                     diverse_idx = text_guided_diversity_selection(
                         remaining_features, sampling_weights, num_diverse_tokens
-                    )
-                    diverse_indices = remaining_indices[diverse_idx]
-            else:
-                # Original diversity selection without text guidance
-                if len(remaining_indices) > 500:
-                    sample_size = min(num_diverse_tokens * 4, len(remaining_indices))
-                    sampled_idx = torch.randperm(len(remaining_indices), device=model_device)[:sample_size]
-                    sampled_indices = remaining_indices[sampled_idx]
-                    
-                    remaining_features = projected_features[0, sampled_indices, :]
-                    remaining_features = F.normalize(remaining_features, p=2, dim=-1)
-                    
-                    diverse_idx = similarity_based_duplicate_removal_fast(
-                        remaining_features, min(num_diverse_tokens, len(sampled_indices))
-                    )
-                    diverse_indices = sampled_indices[diverse_idx]
-                else:
-                    remaining_features = projected_features[0, remaining_indices, :]
-                    remaining_features = F.normalize(remaining_features, p=2, dim=-1)
-                    
-                    diverse_idx = similarity_based_duplicate_removal_fast(
-                        remaining_features, num_diverse_tokens
                     )
                     diverse_indices = remaining_indices[diverse_idx]
         
@@ -518,7 +487,8 @@ def post_http_request_with_embeds(
         "temperature": temperature,
     }
     if guided_choice is not None and len(guided_choice) > 0:
-        pload["structured_outputs"] = {"choice": guided_choice}
+        pload["guided_choice"] = guided_choice
+        #pload["structured_outputs"] = {"choice": guided_choice}
 
     headers = {"Content-Type": "application/json"}
     req = requests.Request('POST', api_url, headers=headers, data=json.dumps(pload))

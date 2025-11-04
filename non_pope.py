@@ -3,95 +3,19 @@ import os
 import time
 import pandas as pd
 from typing import Tuple, List, Dict, Any, Callable
+from util.utils import _generate_prompt
+
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import regexp_replace, col, when, lower, trim
 from pyspark.sql.functions import pandas_udf, col, when, lower, trim
 from pyspark.sql.types import StringType
 from util.mllm import *
 from util.utils import *
 from util.cdencoder import *
-from util.utils import _generate_prompt
-from util.quick_greedy import *
 
 # Get the absolute path of the project root
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "./"))
 sys.path.insert(0, project_root)
 
-
-full_system_prompt = '''You are an expert scientific figure analyst specializing in academic publications.
-Your task is to answer questions about scientific figures and their captions accurately and concisely.
-Answer the given question based *solely* on the information visible in the figure and its provided caption.
-
-The user message will include a 'Question Type'. Adhere strictly to the following rules for formatting your response based on the question type:
-
-- For 'closed-ended finite answer set binary visual' or 'closed-ended finite answer set binary non-visual': 
-  - Respond ONLY with 'Yes' or 'No'. 
-  - Do NOT add any other text, explanations, or punctuation.
-  - Your entire response must be exactly one word: either 'Yes' or 'No'.
-
-- For 'closed-ended finite answer set non-binary visual' or 'closed-ended finite answer set non-binary non-visual': 
-  - Identify the correct option(s) from the provided 'Answer Options'.
-  - Respond ONLY with the letter(s) of the correct option(s) as listed.
-  - For a single correct option, provide only its letter (e.g., 'B').
-  - For multiple correct options, list ALL correct letters separated by commas with NO SPACES (e.g., 'A,C,D').
-  - Ensure ALL correct options are listed and NO incorrect ones.
-  - Do NOT add any other text, explanations, or surrounding punctuation.
-
-- For 'closed-ended infinite answer set visual' or 'closed-ended infinite answer set non-visual': 
-  - Provide a brief, direct answer.
-  - This answer must be a value, a short phrase, a specific name, a label, or a list of values read directly from the figure or caption.
-  - **For numerical values:** Read values as precisely as possible from the graph axes, data points, or labels. Include units ONLY if they appear in the figure.
-  - **For non-numerical values:** Reproduce them EXACTLY as they appear in the figure or caption.
-  - Do NOT add any introductory phrases, explanations, or surrounding text.
-
-- For 'unanswerable': 
-  - Respond ONLY with the exact phrase: 'It is not possible to answer this question based only on the provided data.'
-  - Do NOT add any other text.
-
-IMPORTANT: Your response should ONLY contain the answer in the correct format as specified above - nothing else.
-Do NOT include any additional text, explanations, comments, or contextual information.
-Your answer must be based solely on the information visible in the figure and its provided caption.
-
-Below are examples of questions and answers similar to what you will receive. "
-                "Study these examples carefully to understand the expected answer format. "
-                "Your question will be in the user message after these examples:
-
-Example 1:
-Question: What is the approximate value of the red line at x=5?
-Image: xxx.jpg
-Caption: Figure 3: R10@1 for different ranges on E-commerce.
-QA Type: closed-ended infinite answer set visual
-Answer Options: []
-Answer: 0.66
-
-Example 2:
-Question: Is the value of the red line higher than the value of the blue line at the cut range of 6?
-QA Type: closed-ended finite answer set binary visual
-Answer Options: []
-Answer: Yes
-
-Example 3:
-Question: Which line represents the R10@1 metric?
-QA Type: closed-ended finite answer set binary visual
-Answer Options: [{"A": "The red line"}, {"B": "The blue line"}, {"C": null}, {"D": null}]
-Answer: B
-
-Example 4:
-Question: What is the exact temperature shown in the image?
-QA Type: unanswerable
-Answer Options: []
-Answer: It is not possible to answer this question based only on the provided data.
-
-
-Please only return the Answer field without other field such as Question, QA Type.
-
-'''
-
-
-def extract_image_binary_from_scivqa_data(image_path):
-    with open("/home/haikai/images_train/" + image_path, 'rb') as image_file:
-        binary_data = image_file.read()
-    return binary_data
 
 # Spark configuration
 spark = SparkSession.builder \
@@ -115,124 +39,7 @@ spark = SparkSession.builder \
 API_URL = "http://localhost:8000/v1/chat/completions"
 RECOVERY_RATIO = 0.0
 
-
-def example_reorder_function(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
-    # Convert unhashable types (lists, arrays) to strings for reordering
-    df_for_reorder = df.copy()
-    unhashable_cols = []
-    
-    # Identify columns with unhashable types and convert them
-    for col in df_for_reorder.columns:
-        try:
-            # Try to check if column is hashable
-            df_for_reorder[col].nunique()
-        except TypeError:
-            # If TypeError occurs, convert to string representation
-            unhashable_cols.append(col)
-            df_for_reorder[col] = df_for_reorder[col].apply(
-                lambda x: str(x) if isinstance(x, (list, dict, np.ndarray)) else x
-            )
-    
-    # Perform reordering on the string-converted DataFrame
-    reordered_df_temp, _ = QuickGreedy().reorder(
-        df_for_reorder,
-        early_stop=100000,
-        col_merge=[],
-        one_way_dep=[],
-        distinct_value_threshold=0.7,
-    )
-    
-    # Extract the column order from the reordered dataframe
-    final_column_order = list(reordered_df_temp.columns)
-    
-    # Apply the same column order to the ORIGINAL dataframe (preserving data types)
-    # But also apply the row reordering
-    reordered_df_original = df_for_reorder[final_column_order].copy()
-    
-    # Restore original data types for unhashable columns
-    for col in unhashable_cols:
-        if col in final_column_order:
-            reordered_df_original[col] = df[col].values
-    
-    return reordered_df_original, final_column_order
-
-
-def create_llm_udf_with_embeddings(
-    keep_ratio: float,
-    reorder_function: Callable[[pd.DataFrame], Tuple[pd.DataFrame, List[str]]] = None
-):
-    """
-    Create UDF with optional reordering function.
-    
-    Args:
-        keep_ratio: Token keep ratio for pruning
-        reorder_function: Optional function that takes a DataFrame and returns 
-                         (reordered_df, column_order_list)
-    """
-    @pandas_udf(StringType())
-    def llm_udf_embedding_batch(
-        prompts: pd.Series,
-        *args: pd.Series
-    ) -> pd.Series:        
-        prompt_template = prompts.iloc[0]
-        print(f"Processing batch on PID {os.getpid()} with keep_ratio={keep_ratio}")
-        typed_fields = parse_typed_fields(prompt_template)
-
-        if len(args) != len(typed_fields):
-            raise ValueError(
-                f"Expected {len(typed_fields)} column(s) for fields {[f[0] for f in typed_fields]}, "
-                f"but got {len(args)}."
-            )
-        
-        # Build initial data dictionary
-        data_dict = {}
-        for i, (field_name, field_type) in enumerate(typed_fields):
-            arg = args[i]
-            if isinstance(arg, pd.DataFrame):
-                data_dict[field_name] = arg.values.tolist()
-            elif isinstance(arg, pd.Series):
-                data_dict[field_name] = arg.tolist()
-            else:
-                data_dict[field_name] = list(arg)
-
-        # Create DataFrame
-        merged_df = pd.DataFrame(data_dict)
-        
-        # Apply reordering if function is provided
-        if reorder_function is not None:
-            print(f"\n🔄 Applying reorder function to DataFrame with shape {merged_df.shape}")
-            print(f"Original column order: {list(merged_df.columns)}")
-            
-            reordered_df, reordered_columns = reorder_function(merged_df)
-            
-            print(f"Reordered column order: {reordered_columns}")
-            print(f"Reordered DataFrame shape: {reordered_df.shape}")
-            
-            merged_df = reordered_df
-        else:
-            # If no reordering, maintain original column order
-            reordered_columns = list(merged_df.columns)
-        
-        # Convert to records for processing
-        fields_list = merged_df.to_dict('records')
-        
-        outputs = execute_batch_scivqa_with_pruned_embeddings(
-            modelname="/data/models/llava-1.5-7b-hf",
-            fields=fields_list,
-            query=prompt_template,
-            keep_ratio=keep_ratio,
-            typed_fields=typed_fields,
-            reordered_columns=reordered_columns,  # Pass reordered column sequence
-            system_prompt=full_system_prompt,
-            base_url="http://localhost:8000/v1"
-        )
-        
-        return pd.Series(outputs)
-    
-    return llm_udf_embedding_batch
-
-
-def execute_batch_scivqa_with_pruned_embeddings(
+def execute_batch_pope_with_pruned_embeddings(
     modelname: str,
     fields: List[Dict[str, Any]],
     query: str,
@@ -267,7 +74,6 @@ def execute_batch_scivqa_with_pruned_embeddings(
                 
                 if field_type is None:
                     continue  # Skip if field not found in typed_fields
-                # Build the prompt line by line following reordered sequence
                 if field_type == "text":
                     value = field_dict.get(field_name, "")
                     user_prompt += f"{field_name}: {value}\n"
@@ -277,7 +83,7 @@ def execute_batch_scivqa_with_pruned_embeddings(
                     image_data = field_dict.get(field_name)
                     
                     if image_data is not None:
-                        image_binary = extract_image_binary_from_scivqa_data(image_data)
+                        image_binary = extract_image_binary_from_pope_data(image_data)
                         
                         if keep_ratio == 1:
                             reduced_tokens = getOriginalVisualToken(
@@ -333,6 +139,69 @@ def execute_batch_scivqa_with_pruned_embeddings(
         cleanup_vision_models(vision_tower, model)
 
 
+def create_llm_udf_with_embeddings(
+    keep_ratio: float
+):
+    """
+    Create UDF with optional reordering function.
+    
+    Args:
+        keep_ratio: Token keep ratio for pruning
+        reorder_function: Optional function that takes a DataFrame and returns 
+                         (reordered_df, column_order_list)
+    """
+    @pandas_udf(StringType())
+    def llm_udf_embedding_batch(
+        prompts: pd.Series,
+        *args: pd.Series
+    ) -> pd.Series:        
+        prompt_template = prompts.iloc[0]
+        print(f"Processing batch on PID {os.getpid()} with keep_ratio={keep_ratio}")
+        typed_fields = parse_typed_fields(prompt_template)
+
+        if len(args) != len(typed_fields):
+            raise ValueError(
+                f"Expected {len(typed_fields)} column(s) for fields {[f[0] for f in typed_fields]}, "
+                f"but got {len(args)}."
+            )
+        
+        # Build initial data dictionary
+        data_dict = {}
+        for i, (field_name, field_type) in enumerate(typed_fields):
+            arg = args[i]
+            if isinstance(arg, pd.DataFrame):
+                data_dict[field_name] = arg.values.tolist()
+            elif isinstance(arg, pd.Series):
+                data_dict[field_name] = arg.tolist()
+            else:
+                data_dict[field_name] = list(arg)
+
+        # Create DataFrame
+        merged_df = pd.DataFrame(data_dict)
+        
+        reordered_columns = list(merged_df.columns)
+            
+        
+        # Convert to records for processing
+        fields_list = merged_df.to_dict('records')
+        
+        outputs = execute_batch_pope_with_pruned_embeddings(
+            modelname="/data/models/llava-1.5-7b-hf",
+            fields=fields_list,
+            query=prompt_template,
+            keep_ratio=keep_ratio,
+            typed_fields=typed_fields,
+            reordered_columns=reordered_columns,  # Pass reordered column sequence
+            system_prompt=DEFAULT_SYSTEM_PROMPT,
+            guided_choice=["Yes", "No"],
+            base_url="http://localhost:8000/v1"
+        )
+        
+        return pd.Series(outputs)
+    
+    return llm_udf_embedding_batch
+
+
 def extract_image_binary_from_pope_data(image_data):
     """Extract image binary from POPE data format."""
     if isinstance(image_data, (list, tuple)):
@@ -340,66 +209,44 @@ def extract_image_binary_from_pope_data(image_data):
     return image_data
 
 
-def run_experiment(
-    keep_ratio: float, 
-    dataset_name: str = "POPE_random",
-    reorder_function: Callable[[pd.DataFrame], Tuple[pd.DataFrame, List[str]]] = None
-) -> Tuple[str, float]:
-    """
-    Run experiment with specific keep_ratio and save results.
-    
-    Args:
-        keep_ratio: Token keep ratio for pruning
-        dataset_name: Name of the dataset
-        reorder_function: Optional function to reorder the DataFrame
-    """
+def run_experiment(keep_ratio: float, dataset_name: str = "POPE_random") -> Tuple[str, float]:
+    """Run experiment with specific keep_ratio and save results."""
     print(f"\n{'='*80}")
     print(f"Running experiment with keep_ratio={keep_ratio}")
     print(f"{'='*80}\n")
     
     start_time = time.time()
     
-    # Register UDF with current keep_ratio and reorder function
-    llm_udf = create_llm_udf_with_embeddings(keep_ratio, reorder_function=reorder_function)
+    # Register UDF with current keep_ratio
+    llm_udf = create_llm_udf_with_embeddings(keep_ratio)
     spark.udf.register("LLM", llm_udf)
     
     # Read POPE parquet
-    POPE_PATH = "/home/haikai/train_2025-07-03_09-06.json"
-    pope_df = spark.read \
-        .option("multiLine", "true") \
-        .option("encoding", "UTF-8") \
-        .json(POPE_PATH) \
-        .limit(300) \
-        .cache()
+    POPE_PATH = "/home/haikai/haikai/entropyTest/POPE.parquet"
+    pope_df = spark.read.parquet(POPE_PATH)
     pope_df.createOrReplaceTempView("pope")
     print(f"Total records: {pope_df.count()}")
     
     # Execute query with proper column references
     result_df = spark.sql("""
-            SELECT 
-                answer,
-                LLM('
-        Question: {text:question}
-        Image: {image:image_file}
-        Figure Caption: {text:caption}
-        Figure Type: {text:figure_type}
-        QA Type: {text:qa_pair_type}
-        Answer Options: {text:answer_options}
-        ', question, image_file, caption, figure_type, qa_pair_type, answer_options) as predicted
-            FROM pope
-        """)
+        SELECT 
+            id,
+            question_id,
+            question,
+            answer,
+            image_source,
+            LLM('Given the text: {text:question} and image: {image:image} give me the answer to the question', question, image) as predicted
+        FROM pope
+    """)
     
-    result_df = result_df.withColumn(
-        "predicted",
-        regexp_replace(regexp_replace(col("predicted"), "[\r\n]+", " "), "\\s+", " ")
-    )
-
+    # Normalize both answer and predicted columns for comparison
     result_df_with_comparison = result_df.withColumn(
-    "is_correct",
-    when(
-        lower(col("predicted")).contains(lower(trim(col("answer")))),
-        1
-    ).otherwise(0))
+        "is_correct",
+        when(
+            lower(trim(col("predicted"))) == lower(trim(col("answer"))),
+            1
+        ).otherwise(0)
+    ).drop("question")
     
     # Write results to CSV
     output_path = f"./{dataset_name}_{keep_ratio}.csv"
@@ -424,7 +271,6 @@ def run_experiment(
     print(f"Execution time logged to: {time_log_path}")
     
     return output_path, execution_time
-
 
 def calculate_accuracy(csv_path: str, keep_ratio: float) -> float:
     """Read CSV and calculate accuracy."""
@@ -461,7 +307,7 @@ def calculate_accuracy(csv_path: str, keep_ratio: float) -> float:
 # Main execution
 if __name__ == "__main__":
     keep_ratios = [1, 0.056, 0.111, 0.222]
-    dataset_name = "SciVQA_image_prefix_reorder"
+    dataset_name = "POPE_prune_only"
     
     overall_start = time.time()
     results = {}
@@ -470,12 +316,12 @@ if __name__ == "__main__":
     for keep_ratio in keep_ratios:
         output_path, exec_time = run_experiment(
             keep_ratio, 
-            dataset_name,
-            reorder_function=example_reorder_function  # Pass your reorder function here
+            dataset_name
         )
+        
         execution_times[keep_ratio] = exec_time
         
-        accuracy = 0
+        accuracy = calculate_accuracy(output_path, keep_ratio)
         results[keep_ratio] = accuracy
     
     overall_end = time.time()

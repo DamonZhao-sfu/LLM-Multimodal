@@ -1,363 +1,8 @@
-# import sys
-# import os
-# import time
-# import pandas as pd
-# import torch
-# from typing import Dict, List, Tuple, Any
-# from pyspark.sql import SparkSession
-# from pyspark.sql.functions import pandas_udf, col, when, lower, trim
-# from pyspark.sql.types import StringType
-# from util.mllm import *
-# from util.utils import *
-# from util.cdencoder import *
-# from util.utils import _generate_prompt
-
-# # Get the absolute path of the project root
-# project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "./"))
-# sys.path.insert(0, project_root)
-
-# output_path = "./POPE_image_prefix_144.csv"
-
-# # Spark configuration
-# spark = SparkSession.builder \
-#     .appName("LLM SQL Test") \
-#     .config("spark.driver.memory", "64g") \
-#     .config("spark.executor.memory", "128g") \
-#     .config("spark.executor.cores", "32") \
-#     .config("spark.executor.instances", "1") \
-#     .config("spark.dynamicAllocation.enabled", "false") \
-#     .config("spark.default.parallelism", "1") \
-#     .config("spark.sql.shuffle.partitions", "1") \
-#     .config("spark.sql.execution.arrow.maxRecordsPerBatch", "50000") \
-#     .config("spark.driver.maxResultSize", "4g") \
-#     .config("spark.sql.execution.arrow.pyspark.enabled", "true") \
-#     .config("spark.executor.memoryOverhead", "16g") \
-#     .config("spark.python.worker.memory", "32g") \
-#     .config("spark.rpc.message.maxSize", "512") \
-#     .getOrCreate()
-
-# # Global variables for model configuration
-# API_URL = "http://localhost:8000/v1/chat/completions"
-# KEEP_RATIO = 0.25
-# RECOVERY_RATIO = 0.0
-
-# def extract_image_binary_from_pope_data(image_data):
-#     """Extract image binary from POPE data format."""
-#     if isinstance(image_data, dict):
-#         return image_data['bytes']
-#     if isinstance(image_data, (list, tuple)):
-#         return image_data[0] if len(image_data) > 0 else image_data
-#     return image_data
-
-
-# # Global cache for pruned embeddings
-# PRUNED_EMBEDDING_CACHE = {}
-
-# def preprocess_and_cache_pruned_embeddings(
-#     df: pd.DataFrame,
-#     image_column: str,
-#     question_column: str,
-#     image_id_column: str,
-#     keep_ratio: float,
-#     device: str = 'cuda:0'
-# ) -> Dict[str, torch.Tensor]:
-#     # Load models once for all preprocessing
-#     print("Loading vision models...")
-#     vision_tower, model = load_vision_models(device=device)
-    
-#     try:
-#         # Group questions by image
-#         print(f"\nGrouping questions by {image_id_column}...")
-#         image_groups = df.groupby(image_id_column)
-#         unique_images = len(image_groups)
-        
-#         print(f"Found {unique_images} unique images")
-#         print(f"Total questions in dataset: {len(df)}")
-        
-#         # Display image distribution
-#         image_counts = df.groupby(image_id_column).size().sort_values(ascending=False)
-#         print(f"\nTop 10 most frequently used images:")
-#         for img_id, count in image_counts.head(10).items():
-#             print(f"  {img_id}: {count} questions")
-        
-#         print("\n" + "-" * 80)
-        
-#         pruned_cache = {}
-#         total_pruning_time = 0
-#         successful_prunes = 0
-#         failed_prunes = 0
-        
-#         # Process each unique image
-#         for image_idx, (image_id, image_group) in enumerate(image_groups):
-#             num_questions = len(image_group)
-            
-#             print(f"\n[{image_idx + 1}/{unique_images}] Processing image: {image_id}")
-#             print(f"  Number of questions: {num_questions}")
-            
-#             try:
-#                 # Get image data (same for all rows with this image_id)
-#                 image_data = image_group.iloc[0][image_column]
-#                 # Extract image binary
-#                 image_binary = extract_image_binary_from_pope_data(image_data)
-                
-#                 # Collect all questions for this image
-#                 all_questions = image_group[question_column].tolist()
-                
-#                 # Create combined guidance prompt
-#                 questions_text = ", ".join([f'"{q}"' for q in all_questions])
-#                 combined_guidance = (
-#                     f"Extract the image's key information based on the below questions: "
-#                     f"{questions_text}"
-#                 )
-                
-#                 print(f"  Combined guidance length: {len(combined_guidance)} chars")
-#                 print(f"  Sample questions: {all_questions[:2]}...")
-                
-#                 # Prune image with combined guidance
-#                 print(f"  🔧 Pruning image...")
-#                 prune_start = time.time()
-                
-#                 if keep_ratio == 1:
-#                     # No pruning, use original tokens
-#                     reduced_tokens = getOriginalVisualToken(
-#                         model,
-#                         vision_tower,
-#                         image_binary
-#                     )
-#                 else:
-#                     # Prune with combined guidance
-#                     reduced_tokens = getPrunedVisualTokenVisPruner_optimized(
-#                         model,
-#                         vision_tower,
-#                         image_binary,
-#                         combined_guidance,
-#                         keep_ratio=keep_ratio,
-#                         important_ratio=0.6,
-#                         recovery_ratio=0.0  # Adjust as needed
-#                     )
-                
-#                 prune_end = time.time()
-#                 prune_time = prune_end - prune_start
-#                 total_pruning_time += prune_time
-                
-#                 # Cache the pruned embedding
-#                 pruned_cache[image_id] = {
-#                     'embedding': reduced_tokens.to(torch.float16),
-#                     'prune_time': prune_time,
-#                     'original_tokens': 576,  # LLaVA default
-#                     'pruned_tokens': reduced_tokens.shape[1],
-#                     'num_questions': num_questions,
-#                     'guidance_length': len(combined_guidance)
-#                 }
-                
-#                 successful_prunes += 1
-                
-#                 print(f"  ✅ Pruning successful!")
-#                 print(f"  📊 Original: 576 tokens → Pruned: {reduced_tokens.shape[1]} tokens")
-#                 print(f"  📉 Reduction: {((576 - reduced_tokens.shape[1]) / 576 * 100):.1f}%")
-#                 print(f"  ⏱️  Time: {prune_time:.2f}s")
-                
-#             except Exception as e:
-#                 failed_prunes += 1
-#                 print(f"  ❌ Error pruning image {image_id}: {e}")
-#                 import traceback
-#                 traceback.print_exc()
-#                 continue
-        
-#         print("\n" + "=" * 80)
-#         print("PREPROCESSING COMPLETE")
-#         print("=" * 80)
-#         print(f"✅ Successfully pruned: {successful_prunes} images")
-#         print(f"❌ Failed to prune: {failed_prunes} images")
-#         print(f"⏱️  Total pruning time: {total_pruning_time:.2f}s")
-#         print(f"⏱️  Average time per image: {total_pruning_time / successful_prunes:.2f}s")
-#         print("=" * 80)
-        
-#         return pruned_cache
-    
-#     finally:
-#         # Clean up models
-#         print("\nCleaning up vision models...")
-#         cleanup_vision_models(vision_tower, model)
-#         print("Cleanup complete.")
-
-
-# def inference_with_cached_embeddings(
-#     modelname: str,
-#     fields: List[Dict[str, Any]],
-#     query: str,
-#     typed_fields: List[Tuple[str, str]],
-#     embedding_cache: Dict[str, Dict],
-#     image_source_mapping: Dict[int, str],
-#     system_prompt: str = DEFAULT_SYSTEM_PROMPT,
-#     guided_choice: List[str] = None,
-#     base_url: str = "http://localhost:8000/v1",
-# ) -> List[str]:
-#     user_prompts = []
-#     all_pruned_embeddings = []
-    
-#     # Build prompts and retrieve cached embeddings
-#     for idx, field_dict in enumerate(fields):
-#         user_prompt = query
-#         pruned_embedding = None
-        
-#         image_source = image_source_mapping.get(idx)
-        
-#         for field_name, field_type in typed_fields:
-#             placeholder = f"{{{field_type}:{field_name}}}"
-            
-#             if field_type == "text":
-#                 value = field_dict.get(field_name, "")
-#                 user_prompt = user_prompt.replace(placeholder, str(value))
-            
-#             elif field_type == "image":
-#                 user_prompt = user_prompt.replace(placeholder, "[image]")
-                
-#                 # Retrieve cached embedding instead of processing image
-#                 if image_source and image_source in embedding_cache:
-#                     pruned_embedding = embedding_cache[image_source]['embedding']
-#                 else:
-#                     print(f"Warning: No cached embedding found for image_id: {image_source}")
-#                     pruned_embedding = None
-        
-#         user_prompts.append(user_prompt)
-#         all_pruned_embeddings.append(pruned_embedding)
-    
-#     # Generate full prompts
-#     prompts = [
-#         _generate_prompt(user_prompt=user_prompt, system_prompt=system_prompt)
-#         for user_prompt in user_prompts
-#     ]
-    
-#     # Send requests to API
-#     outputs = []
-#     if base_url:
-#         for i, prompt in enumerate(prompts):
-#             response = post_http_request_with_embeds(
-#                 modelname,
-#                 [prompt],
-#                 temperature=0,
-#                 api_url=(base_url + "/chat/completions"),
-#                 guided_choice=guided_choice,
-#                 image_embeddings=[all_pruned_embeddings[i]] if all_pruned_embeddings[i] is not None else None
-#             )
-            
-#             request_output = json.loads(response.content)
-#             choices = request_output.get('choices', [])
-            
-#             if choices and 'message' in choices[0] and 'content' in choices[0]['message']:
-#                 outputs.append(choices[0]['message']['content'])
-#             else:
-#                 outputs.append(None)
-    
-#     return outputs
-
-
-# def create_llm_udf_with_cached_embeddings(embedding_cache: Dict[str, Dict], image_source_mapping: Dict[int, str]):
-#     @pandas_udf(StringType())
-#     def llm_udf_cached_embeddings(
-#         prompts: pd.Series,
-#         *args: pd.Series
-#     ) -> pd.Series:
-#         prompt_template = prompts.iloc[0]
-#         print(f"Processing batch on PID {os.getpid()} with cached embeddings")
-        
-#         typed_fields = parse_typed_fields(prompt_template)
-        
-#         if len(args) != len(typed_fields):
-#             raise ValueError(
-#                 f"Expected {len(typed_fields)} column(s) for fields {[f[0] for f in typed_fields]}, "
-#                 f"but got {len(args)}."
-#             )
-        
-#         data_dict = {}
-#         for i, (field_name, field_type) in enumerate(typed_fields):
-#             arg = args[i]
-#             if isinstance(arg, pd.DataFrame):
-#                 data_dict[field_name] = arg.values.tolist()
-#             elif isinstance(arg, pd.Series):
-#                 data_dict[field_name] = arg.tolist()
-#             else:
-#                 data_dict[field_name] = list(arg)
-        
-#         merged_df = pd.DataFrame(data_dict)
-#         fields_list = merged_df.to_dict('records')
-
-#         outputs = inference_with_cached_embeddings(
-#             modelname="llava-hf/llava-1.5-7b-hf",
-#             fields=fields_list,
-#             query=prompt_template,
-#             typed_fields=typed_fields,
-#             embedding_cache=embedding_cache,
-#             image_source_mapping=image_source_mapping,  # Use the reordered mapping
-#             system_prompt=DEFAULT_SYSTEM_PROMPT,
-#             guided_choice=["Yes", "No"],
-#             base_url="http://localhost:8000/v1"
-#         )
-        
-#         return pd.Series(outputs)
-    
-#     return llm_udf_cached_embeddings
-
-# # Main execution
-# start_time = time.time()
-
-# # Read POPE parquet
-# POPE_PATH = "/scratch/hpc-prf-haqc/haikai/dataset/POPE/random-00000-of-00001.parquet"
-# pope_df = spark.read.parquet(POPE_PATH)
-# pope_df.createOrReplaceTempView("pope")
-# print(f"Total records: {pope_df.count()}")
-
-# pope_pandas_df = pope_df.toPandas()
-
-# embedding_cache = preprocess_and_cache_pruned_embeddings(
-#     df=pope_pandas_df,
-#     image_column='image',
-#     question_column='question',
-#     image_id_column='image_source',
-#     keep_ratio=0.111,
-#     device='cuda:0'
-# )
-
-# image_source_mapping_reordered = {idx: row['image_source'] for idx, row in pope_pandas_df.iterrows()}
-
-# llm_udf=create_llm_udf_with_cached_embeddings(embedding_cache, image_source_mapping_reordered)
-# spark.udf.register("LLM", llm_udf)
-
-# # Execute query with proper column references - include all relevant columns
-# result_df = spark.sql("""
-#     SELECT 
-#         id,
-#         question_id,
-#         question,
-#         answer,
-#         image_source,
-#         LLM('Given the text: {text:question} and image: {image:image}, give me the answer to the question', question, image) as predicted
-#     FROM pope
-# """)
-
-# # Normalize both answer and predicted columns for comparison (case-insensitive, trimmed)
-# result_df_with_comparison = result_df.withColumn(
-#     "is_correct",
-#     when(
-#         lower(trim(col("predicted"))) == lower(trim(col("answer"))),
-#         1
-#     ).otherwise(0)
-# )
-
-# # Write results to CSV
-# result_df_with_comparison.coalesce(1).write.mode("overwrite").option("header", "true").csv(output_path)
-# end_time = time.time()
-# print(f"\nTotal execution time: {end_time - start_time:.2f} seconds")
-
-# spark.stop()
-
 import sys
 import os
 import time
 import pandas as pd
-import torch
-from typing import Dict, List, Tuple, Any
+from typing import Tuple, List, Dict, Any, Callable
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import pandas_udf, col, when, lower, trim
 from pyspark.sql.types import StringType
@@ -365,10 +10,12 @@ from util.mllm import *
 from util.utils import *
 from util.cdencoder import *
 from util.utils import _generate_prompt
+from util.quick_greedy import *
 
 # Get the absolute path of the project root
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "./"))
 sys.path.insert(0, project_root)
+
 
 # Spark configuration
 spark = SparkSession.builder \
@@ -537,6 +184,7 @@ def inference_with_cached_embeddings(
     typed_fields: List[Tuple[str, str]],
     embedding_cache: Dict[str, Dict],
     image_source_mapping: Dict[int, str],
+    reordered_columns: List[str],  # NEW: List of columns in reordered sequence
     system_prompt: str = DEFAULT_SYSTEM_PROMPT,
     guided_choice: List[str] = None,
     base_url: str = "http://localhost:8000/v1",
@@ -546,29 +194,39 @@ def inference_with_cached_embeddings(
     
     # Build prompts and retrieve cached embeddings
     for idx, field_dict in enumerate(fields):
-        user_prompt = query
+        # Initialize prompt with empty string - we'll build it from scratch
+        user_prompt = ""
         pruned_embedding = None
         
         image_source = image_source_mapping.get(idx)
         
-        for field_name, field_type in typed_fields:
-            placeholder = f"{{{field_type}:{field_name}}}"
+        # Build prompt following the REORDERED column sequence
+        for field_name in reordered_columns:
+            # Find the field type for this field name
+            field_type = None
+            for fname, ftype in typed_fields:
+                if fname == field_name:
+                    field_type = ftype
+                    break
             
+            if field_type is None:
+                continue  # Skip if field not found in typed_fields
+            # Build the prompt line by line following reordered sequence
             if field_type == "text":
                 value = field_dict.get(field_name, "")
-                user_prompt = user_prompt.replace(placeholder, str(value))
+                user_prompt += f"{field_name}: {value}\n"
             
             elif field_type == "image":
-                user_prompt = user_prompt.replace(placeholder, "[image]")
+                user_prompt += f"{field_name}: [image]\n"
                 
-                # Retrieve cached embedding instead of processing image
+                # Retrieve cached embedding
                 if image_source and image_source in embedding_cache:
                     pruned_embedding = embedding_cache[image_source]['embedding']
                 else:
                     print(f"Warning: No cached embedding found for image_id: {image_source}")
                     pruned_embedding = None
         
-        user_prompts.append(user_prompt)
+        user_prompts.append(user_prompt.strip())  # Remove trailing newline
         all_pruned_embeddings.append(pruned_embedding)
     
     # Generate full prompts
@@ -600,24 +258,25 @@ def inference_with_cached_embeddings(
     
     return outputs
 
-
-def create_llm_udf_with_cached_embeddings(embedding_cache: Dict[str, Dict], image_source_mapping: Dict[int, str]):
+def create_llm_udf_with_cached_embeddings(
+    embedding_cache: Dict[str, Dict], 
+    image_source_mapping: Dict[int, str],
+    reorder_function: Callable[[pd.DataFrame], Tuple[pd.DataFrame, List[str]]] = None  # NEW parameter
+):
     @pandas_udf(StringType())
     def llm_udf_cached_embeddings(
         prompts: pd.Series,
         *args: pd.Series
     ) -> pd.Series:
-        prompt_template = prompts.iloc[0]
-        print(f"Processing batch on PID {os.getpid()} with cached embeddings")
-        
+        prompt_template = prompts.iloc[0]        
         typed_fields = parse_typed_fields(prompt_template)
-        
         if len(args) != len(typed_fields):
             raise ValueError(
                 f"Expected {len(typed_fields)} column(s) for fields {[f[0] for f in typed_fields]}, "
                 f"but got {len(args)}."
             )
         
+        # Build initial data dictionary
         data_dict = {}
         for i, (field_name, field_type) in enumerate(typed_fields):
             arg = args[i]
@@ -628,16 +287,35 @@ def create_llm_udf_with_cached_embeddings(embedding_cache: Dict[str, Dict], imag
             else:
                 data_dict[field_name] = list(arg)
         
+        # Create DataFrame
         merged_df = pd.DataFrame(data_dict)
+        
+        # Apply reordering if function is provided
+        if reorder_function is not None:
+            print(f"\n🔄 Applying reorder function to DataFrame with shape {merged_df.shape}")
+            print(f"Original column order: {list(merged_df.columns)}")
+            
+            reordered_df, reordered_columns = reorder_function(merged_df)
+            
+            print(f"Reordered column order: {reordered_columns}")
+            print(f"Reordered DataFrame shape: {reordered_df.shape}")
+            
+            merged_df = reordered_df
+        else:
+            # If no reordering, maintain original column order
+            reordered_columns = list(merged_df.columns)
+        
+        # Convert to records for processing
         fields_list = merged_df.to_dict('records')
 
         outputs = inference_with_cached_embeddings(
-            modelname="llava-hf/llava-1.5-7b-hf",
+            modelname="/data/models/llava-1.5-7b-hf",
             fields=fields_list,
             query=prompt_template,
             typed_fields=typed_fields,
             embedding_cache=embedding_cache,
             image_source_mapping=image_source_mapping,
+            reordered_columns=reordered_columns,  # Pass the reordered column sequence
             system_prompt=DEFAULT_SYSTEM_PROMPT,
             guided_choice=["Yes", "No"],
             base_url="http://localhost:8000/v1"
@@ -647,21 +325,20 @@ def create_llm_udf_with_cached_embeddings(embedding_cache: Dict[str, Dict], imag
     
     return llm_udf_cached_embeddings
 
-def run_experiment_with_cached_embeddings(
-    keep_ratio: float,
+
+def run_experiment(
+    keep_ratio: float, 
     pope_pandas_df: pd.DataFrame,
-    pope_spark_df,
-    dataset_name: str = "POPE_image_prefix"
+    dataset_name: str = "POPE_random",
+    reorder_function: Callable[[pd.DataFrame], Tuple[pd.DataFrame, List[str]]] = None
 ) -> Tuple[str, float]:
-    """Run experiment with cached embeddings for a specific keep_ratio."""
+    """Run experiment with specific keep_ratio and save results."""
     print(f"\n{'='*80}")
     print(f"Running experiment with keep_ratio={keep_ratio}")
     print(f"{'='*80}\n")
     
     start_time = time.time()
-    
-    # Preprocess and cache pruned embeddings
-    print(f"Preprocessing images with keep_ratio={keep_ratio}...")
+
     embedding_cache = preprocess_and_cache_pruned_embeddings(
         df=pope_pandas_df,
         image_column='image',
@@ -670,21 +347,22 @@ def run_experiment_with_cached_embeddings(
         keep_ratio=keep_ratio,
         device='cuda:0'
     )
-    
-    # Create image source mapping
+
     image_source_mapping_reordered = {
         idx: row['image_source'] 
         for idx, row in pope_pandas_df.iterrows()
     }
     
-    # Create and register UDF
+    # Register UDF with current keep_ratio
     llm_udf = create_llm_udf_with_cached_embeddings(
         embedding_cache, 
-        image_source_mapping_reordered
-    )
+        image_source_mapping_reordered,
+        reorder_function=reorder_function  # Pass the reordering function
+    )    
+    
     spark.udf.register("LLM", llm_udf)
     
-    # Execute query
+    # Execute query with proper column references
     result_df = spark.sql("""
         SELECT 
             id,
@@ -692,11 +370,11 @@ def run_experiment_with_cached_embeddings(
             question,
             answer,
             image_source,
-            LLM('Given the text: {text:question} and image: {image:image}, give me the answer to the question', question, image) as predicted
+            LLM('Given the text: {text:question} and image: {image:image} give me the answer to the question', question, image) as predicted
         FROM pope
     """)
     
-    # Add comparison column
+    # Normalize both answer and predicted columns for comparison
     result_df_with_comparison = result_df.withColumn(
         "is_correct",
         when(
@@ -728,6 +406,46 @@ def run_experiment_with_cached_embeddings(
     print(f"Execution time logged to: {time_log_path}")
     
     return output_path, execution_time
+
+def example_reorder_function(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
+    # Convert unhashable types (lists, arrays) to strings for reordering
+    df_for_reorder = df.copy()
+    unhashable_cols = []
+    
+    # Identify columns with unhashable types and convert them
+    for col in df_for_reorder.columns:
+        try:
+            # Try to check if column is hashable
+            df_for_reorder[col].nunique()
+        except TypeError:
+            # If TypeError occurs, convert to string representation
+            unhashable_cols.append(col)
+            df_for_reorder[col] = df_for_reorder[col].apply(
+                lambda x: str(x) if isinstance(x, (list, dict, np.ndarray)) else x
+            )
+    
+    # Perform reordering on the string-converted DataFrame
+    reordered_df_temp, _ = QuickGreedy().reorder(
+        df_for_reorder,
+        early_stop=100000,
+        col_merge=[],
+        one_way_dep=[],
+        distinct_value_threshold=0.7,
+    )
+    
+    # Extract the column order from the reordered dataframe
+    final_column_order = list(reordered_df_temp.columns)
+    
+    # Apply the same column order to the ORIGINAL dataframe (preserving data types)
+    # But also apply the row reordering
+    reordered_df_original = df_for_reorder[final_column_order].copy()
+    
+    # Restore original data types for unhashable columns
+    for col in unhashable_cols:
+        if col in final_column_order:
+            reordered_df_original[col] = df[col].values
+    
+    return reordered_df_original, final_column_order
 
 
 def calculate_accuracy(csv_path: str, keep_ratio: float) -> float:
@@ -764,42 +482,31 @@ def calculate_accuracy(csv_path: str, keep_ratio: float) -> float:
 
 # Main execution
 if __name__ == "__main__":
-    keep_ratios = [0.056, 0.111, 0.222]
-    dataset_name = "POPE_image_prefix"
-    
-    overall_start = time.time()
-    
-    # Read POPE parquet once
-    POPE_PATH = "/scratch/hpc-prf-haqc/haikai/dataset/POPE/random-00000-of-00001.parquet"
+    keep_ratios = [1, 0.056, 0.111, 0.222]
+    dataset_name = "POPE_V1_GROUPING"
+
+    # Read POPE parquet
+    POPE_PATH = "/home/haikai/haikai/entropyTest/POPE.parquet"
     pope_df = spark.read.parquet(POPE_PATH)
     pope_df.createOrReplaceTempView("pope")
-    print(f"Total records: {pope_df.count()}")
-    
-    # Convert to pandas once
     pope_pandas_df = pope_df.toPandas()
-    
+
+    overall_start = time.time()
     results = {}
     execution_times = {}
-    
-    # Run experiments for each keep_ratio
+
     for keep_ratio in keep_ratios:
-        output_path, exec_time = run_experiment_with_cached_embeddings(
-            keep_ratio=keep_ratio,
-            pope_pandas_df=pope_pandas_df,
-            pope_spark_df=pope_df,
-            dataset_name=dataset_name
+        output_path, exec_time = run_experiment(
+            keep_ratio, 
+            pope_pandas_df,
+            dataset_name,
+            reorder_function=example_reorder_function  # Pass your reorder function here
         )
         
         execution_times[keep_ratio] = exec_time
         
-        # Calculate accuracy
-        accuracy = calculate_accuracy(output_path, keep_ratio)
+        accuracy = 0
         results[keep_ratio] = accuracy
-        
-        # Clear GPU memory between experiments
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            print("GPU cache cleared")
     
     overall_end = time.time()
     overall_time = overall_end - overall_start

@@ -278,7 +278,7 @@ def create_llm_udf_with_cached_embeddings(embedding_cache: Dict[str, Dict], imag
         fields_list = merged_df.to_dict('records')
 
         outputs = inference_with_cached_embeddings(
-            modelname="llava-hf/llava-1.5-7b-hf",
+            modelname="/data/models/llava-1.5-7b-hf",
             fields=fields_list,
             query=prompt_template,
             typed_fields=typed_fields,
@@ -349,7 +349,7 @@ def run_experiment_with_cached_embeddings(
             lower(trim(col("predicted"))) == lower(trim(col("answer"))),
             1
         ).otherwise(0)
-    )
+    ).drop("question")
     
     # Write results to CSV
     output_path = f"./{dataset_name}_{keep_ratio}.csv"
@@ -410,13 +410,13 @@ def calculate_accuracy(csv_path: str, keep_ratio: float) -> float:
 
 # Main execution
 if __name__ == "__main__":
-    keep_ratios = [0.056, 0.111, 0.222]
-    dataset_name = "POPE_image_prefix"
+    keep_ratios = [1, 0.056, 0.111, 0.222]
+    dataset_name = "POPE_grouping"
     
     overall_start = time.time()
     
     # Read POPE parquet once
-    POPE_PATH = "/scratch/hpc-prf-haqc/haikai/dataset/POPE/random-00000-of-00001.parquet"
+    POPE_PATH = "/home/haikai/haikai/entropyTest/POPE.parquet"
     pope_df = spark.read.parquet(POPE_PATH)
     pope_df.createOrReplaceTempView("pope")
     print(f"Total records: {pope_df.count()}")
