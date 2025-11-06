@@ -15,18 +15,15 @@ import time
 from typing import List, Dict, Tuple
 from util.prompt import DEFAULT_SYSTEM_PROMPT
 from util.utils import _generate_prompt
-
-
-
 import gc
 
 
-def load_vision_models(device='cuda:0'):
+def load_vision_models(device='cuda'):
     """Load vision tower and projection model"""
     print(f"[Model Loading] Loading vision tower on {device}...")
     
     # Set CUDA device
-    torch.cuda.set_device(0)
+    #torch.cuda.set_device(0)
     vision_tower_name = "/data/models/clip-vit-p14-336/snapshots/ce19dc912ca5cd21c8a653c79e251e808ccabcd1"  # Default CLIP model
     MODEL_PATH = "/data/models/llava-1.5-7b-hf"
 
@@ -40,14 +37,14 @@ def load_vision_models(device='cuda:0'):
     
     mock_args = MockArgs()
     vision_tower = CLIPVisionTower(vision_tower_name, mock_args, delay_load=False)
-    vision_tower = vision_tower.to(device)
+    vision_tower = vision_tower.to('cuda')
     vision_tower.vision_tower.config._attn_implementation = "eager"
     vision_tower.vision_tower.config.output_attentions = True
     # Load LLaVA model for projection layer
     model = LlavaForConditionalGeneration.from_pretrained(
         MODEL_PATH, 
         torch_dtype=torch.float16, 
-        device_map=device,
+        device_map='cuda:2',
         attn_implementation="eager"
     )
     
@@ -55,6 +52,21 @@ def load_vision_models(device='cuda:0'):
     
     return vision_tower, model
 
+
+def load_vision_models_only(device='cuda'):
+    vision_tower_name = "/data/models/clip-vit-p14-336/snapshots/ce19dc912ca5cd21c8a653c79e251e808ccabcd1"  # Default CLIP model
+    class MockArgs:
+        def __init__(self):
+            self.mm_vision_select_layer = -2
+            self.mm_vision_select_feature = 'patch'
+    
+    mock_args = MockArgs()
+    vision_tower = CLIPVisionTower(vision_tower_name, mock_args, delay_load=False)
+    vision_tower = vision_tower.to('cuda')
+    # vision_tower.vision_tower.config._attn_implementation = "eager"
+    # vision_tower.vision_tower.config.output_attentions = True
+    
+    return vision_tower
 
 def cleanup_vision_models(vision_tower, model):
     """Clean up GPU memory used by vision models"""
@@ -589,8 +601,9 @@ def execute_batch_v2_with_pruned_embeddings(
             return outputs
     
     finally:
+        pass
         # Always clean up models, even if an error occurred
-        cleanup_vision_models(vision_tower, model)
+        #(vision_tower, model)
 
 # Helper function to extract image binary (you'll need to implement this based on your data format)
 def extract_image_binary_from_pope_data(image_data):
