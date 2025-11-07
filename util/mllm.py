@@ -1,7 +1,9 @@
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from PIL import Image
 from util.cdencoder import CLIPVisionTower
+from transformers import AutoProcessor
 from transformers import LlavaForConditionalGeneration, LlavaProcessor, CLIPVisionModel, CLIPImageProcessor
 import time
 import torch
@@ -12,7 +14,7 @@ import io
 import base64
 import json
 import time
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional, Any
 from util.prompt import DEFAULT_SYSTEM_PROMPT
 from util.utils import _generate_prompt
 import gc
@@ -44,13 +46,17 @@ def load_vision_models(device='cuda'):
     model = LlavaForConditionalGeneration.from_pretrained(
         MODEL_PATH, 
         torch_dtype=torch.float16, 
-        device_map='cuda:2',
+        device_map='cuda',
         attn_implementation="eager"
     )
+
+    processor = AutoProcessor.from_pretrained(MODEL_PATH)
+
+    tokenizer = processor.tokenizer
     
     print(f"[Model Loading] Vision tower loaded successfully on {device}")
     
-    return vision_tower, model
+    return vision_tower, model, tokenizer
 
 
 def load_vision_models_only(device='cuda'):
@@ -164,7 +170,6 @@ def call_vllm_api_with_embeds(image_embedding, question="What's in this image?",
 
 
 def getOriginalVisualToken(model, vision_tower, image_binary):
-    # Load and preprocess image
     
     image = Image.open(io.BytesIO(image_binary))
     inputs = vision_tower.image_processor(image, return_tensors="pt")
@@ -184,10 +189,12 @@ def getOriginalVisualToken(model, vision_tower, image_binary):
         image_features = image_outputs.to(images.dtype)
       
     torch.cuda.synchronize()
-    
     image_features = image_features.to(device=model_device, dtype=torch.float16)
     model.multi_modal_projector = model.multi_modal_projector.to(model_device)
-    image_features = model.multi_modal_projector(image_features).detach().cpu()
+    image_features = model.multi_modal_projector(image_features).detach().cpu() 
+
+    # mm_projector = nn.Linear(1024, 4096).to(device=model_device, dtype=torch.float16)
+    # image_features = mm_projector(image_features)
     return image_features
 
 
@@ -461,15 +468,32 @@ def getPrunedVisualTokenVisPruner_optimized(model, vision_tower, image_binary, t
     
     return result
 
-
 def post_http_request_with_embeds(
     model: str,
     prompts: List[str],
     temperature: float = 1.0,
     api_url: str = "http://localhost:8000/v1/chat/completions",
     guided_choice: List[str] = None,
-    image_embeddings: List[torch.Tensor] = None,  # Changed: List of embedding tensors
+    image_embeddings: List[torch.Tensor] = None,
+    answer_schema: Optional[Dict[str, Any]] = None,  # Optional JSON schema parameter
 ) -> requests.Response:
+    """
+    Send HTTP POST request with embeddings and optional structured output.
+    
+    Args:
+        model: Model name
+        prompts: List of prompt strings
+        temperature: Sampling temperature
+        api_url: API endpoint URL
+        guided_choice: Optional guided choice list
+        image_embeddings: Optional list of image embedding tensors
+        answer_schema: Optional JSON schema for guided_json (vLLM structured outputs)
+                      If None, no structured output is used.
+                      Example: {"type": "object", "properties": {"Answer": {"type": "string"}}, "required": ["Answer"]}
+    
+    Returns:
+        requests.Response object
+    """
     messages_list = []
     
     for i, prompt in enumerate(prompts):
@@ -492,15 +516,19 @@ def post_http_request_with_embeds(
             "role": "user",
             "content": content
         })
-    
+
     pload = {
         "model": model,
         "messages": messages_list,
         "temperature": temperature,
     }
+    
+    # Add guided_json only if answer_schema is provided
+    if answer_schema is not None:
+        pload["guided_json"] = answer_schema
+    
     if guided_choice is not None and len(guided_choice) > 0:
         pload["guided_choice"] = guided_choice
-        #pload["structured_outputs"] = {"choice": guided_choice}
 
     headers = {"Content-Type": "application/json"}
     req = requests.Request('POST', api_url, headers=headers, data=json.dumps(pload))
@@ -510,6 +538,68 @@ def post_http_request_with_embeds(
         response = session.send(prepared)
 
     return response
+
+
+# def post_http_request_with_embeds(
+#     model: str,
+#     prompts: List[str],
+#     temperature: float = 1.0,
+#     api_url: str = "http://localhost:8000/v1/chat/completions",
+#     guided_choice: List[str] = None,
+#     image_embeddings: List[torch.Tensor] = None,  # Changed: List of embedding tensors
+# ) -> requests.Response:
+#     messages_list = []
+    
+#     for i, prompt in enumerate(prompts):
+#         content = []
+        
+#         content.append({
+#             "type": "text",
+#             "text": prompt
+#         })
+        
+#         if image_embeddings and i < len(image_embeddings) and image_embeddings[i] is not None:
+#             embedding_data = image_embeddings[i]
+#             embedding = encode_image_embedding_to_base64(embedding_data)
+#             content.append({
+#                 "type": "image_embeds",
+#                 "image_embeds": embedding
+#             })
+        
+#         messages_list.append({
+#             "role": "user",
+#             "content": content
+#         })
+    
+#     answer_schema = {
+#         "type": "object",
+#         "properties": {
+#             "Answer": {
+#                 "type": "string"
+#             }
+#         },
+#         "required": ["Answer"]
+#     }
+
+#     pload = {
+#         "model": model,
+#         "messages": messages_list,
+#         "temperature": temperature,
+#         "guided_json": answer_schema,  # vLLM's guided_json parameter
+
+#     }
+#     if guided_choice is not None and len(guided_choice) > 0:
+#         pload["guided_choice"] = guided_choice
+
+
+#     headers = {"Content-Type": "application/json"}
+#     req = requests.Request('POST', api_url, headers=headers, data=json.dumps(pload))
+#     prepared = req.prepare()
+
+#     with requests.Session() as session:
+#         response = session.send(prepared)
+
+#     return response
 
 def execute_batch_v2_with_pruned_embeddings(
     modelname,
