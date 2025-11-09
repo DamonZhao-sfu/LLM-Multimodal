@@ -5,12 +5,14 @@ import pandas as pd
 import torch
 from typing import Dict, List, Tuple, Any
 from pyspark.sql import SparkSession
+from pyspark.sql.functions import regexp_replace, col, when, lower, trim
 from pyspark.sql.functions import pandas_udf, col, when, lower, trim
 from pyspark.sql.types import StringType
 from util.mllm import *
 from util.utils import *
 from util.cdencoder import *
 from util.utils import _generate_prompt
+from util.trimTokenator import *
 
 # Get the absolute path of the project root
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "./"))
@@ -38,14 +40,78 @@ spark = SparkSession.builder \
 API_URL = "http://localhost:8000/v1/chat/completions"
 RECOVERY_RATIO = 0.0
 
-def extract_image_binary_from_pope_data(image_data):
-    """Extract image binary from POPE data format."""
-    if isinstance(image_data, dict):
-        return image_data['bytes']
-    if isinstance(image_data, (list, tuple)):
-        return image_data[0] if len(image_data) > 0 else image_data
-    return image_data
+full_system_prompt = '''You are an expert scientific figure analyst specializing in academic publications.
+Your task is to answer questions about scientific figures and their captions accurately and concisely.
+Answer the given question based *solely* on the information visible in the figure and its provided caption.
 
+The user message will include a 'Question Type'. Adhere strictly to the following rules for formatting your response based on the question type:
+
+- For 'closed-ended finite answer set binary visual' or 'closed-ended finite answer set binary non-visual': 
+  - Respond ONLY with 'Yes' or 'No'. 
+  - Do NOT add any other text, explanations, or punctuation.
+  - Your entire response must be exactly one word: either 'Yes' or 'No'.
+
+- For 'closed-ended finite answer set non-binary visual' or 'closed-ended finite answer set non-binary non-visual': 
+  - Identify the correct option(s) from the provided 'Answer Options'.
+  - Respond ONLY with the letter(s) of the correct option(s) as listed.
+  - For a single correct option, provide only its letter (e.g., 'B').
+  - For multiple correct options, list ALL correct letters separated by commas with NO SPACES (e.g., 'A,C,D').
+  - Ensure ALL correct options are listed and NO incorrect ones.
+  - Do NOT add any other text, explanations, or surrounding punctuation.
+
+- For 'closed-ended infinite answer set visual' or 'closed-ended infinite answer set non-visual': 
+  - Provide a brief, direct answer.
+  - This answer must be a value, a short phrase, a specific name, a label, or a list of values read directly from the figure or caption.
+  - **For numerical values:** Read values as precisely as possible from the graph axes, data points, or labels. Include units ONLY if they appear in the figure.
+  - **For non-numerical values:** Reproduce them EXACTLY as they appear in the figure or caption.
+  - Do NOT add any introductory phrases, explanations, or surrounding text.
+
+- For 'unanswerable': 
+  - Respond ONLY with the exact phrase: 'It is not possible to answer this question based only on the provided data.'
+  - Do NOT add any other text.
+
+IMPORTANT: Your response should ONLY contain the answer in the correct format as specified above - nothing else.
+Do NOT include any additional text, explanations, comments, or contextual information.
+Your answer must be based solely on the information visible in the figure and its provided caption.
+
+Below are examples of questions and answers similar to what you will receive. "
+                "Study these examples carefully to understand the expected answer format. "
+                "Your question will be in the user message after these examples:
+
+Example 1:
+Question: What is the approximate value of the red line at x=5?
+Image: xxx.jpg
+Caption: Figure 3: R10@1 for different ranges on E-commerce.
+QA Type: closed-ended infinite answer set visual
+Answer Options: []
+Answer: 0.66
+
+Example 2:
+Question: Is the value of the red line higher than the value of the blue line at the cut range of 6?
+QA Type: closed-ended finite answer set binary visual
+Answer Options: []
+Answer: Yes
+
+Example 3:
+Question: Which line represents the R10@1 metric?
+QA Type: closed-ended finite answer set binary visual
+Answer Options: [{"A": "The red line"}, {"B": "The blue line"}, {"C": null}, {"D": null}]
+Answer: B
+
+Example 4:
+Question: What is the exact temperature shown in the image?
+QA Type: unanswerable
+Answer Options: []
+Answer: It is not possible to answer this question based only on the provided data.
+
+
+Please only return the Answer.
+'''
+
+def extract_image_binary_from_pope_data(image_path):
+    with open("/home/haikai/images_train/" + image_path, 'rb') as image_file:
+        binary_data = image_file.read()
+    return binary_data
 
 def preprocess_and_cache_pruned_embeddings(
     df: pd.DataFrame,
@@ -54,10 +120,11 @@ def preprocess_and_cache_pruned_embeddings(
     image_id_column: str,
     keep_ratio: float,
     device: str = 'cuda:0'
-) -> Dict[str, Dict]:
+) -> Tuple[Dict[str, Dict], float]:
+    """Returns pruned cache and total pruning time."""
     # Load models once for all preprocessing
     print("Loading vision models...")
-    vision_tower, model, _ = load_vision_models(device=device)
+    vision_tower, model, tokenizer = load_vision_models(device=device)
     
     try:
         # Group questions by image
@@ -90,9 +157,9 @@ def preprocess_and_cache_pruned_embeddings(
             
             try:
                 # Get image data (same for all rows with this image_id)
-                image_data = image_group.iloc[0][image_column]
+                image_path = image_group.iloc[0][image_column]
                 # Extract image binary
-                image_binary = extract_image_binary_from_pope_data(image_data)
+                image_binary = extract_image_binary_from_pope_data(image_path)
                 
                 # Collect all questions for this image
                 all_questions = image_group[question_column].tolist()
@@ -120,14 +187,13 @@ def preprocess_and_cache_pruned_embeddings(
                     )
                 else:
                     # Prune with combined guidance
-                    reduced_tokens = getPrunedVisualTokenVisPruner_optimized(
+                    reduced_tokens = trimTokenatorPruning(
                         model,
                         vision_tower,
+                        tokenizer,
                         image_binary,
                         combined_guidance,
-                        keep_ratio=keep_ratio,
-                        important_ratio=0.6,
-                        recovery_ratio=0.0  # Adjust as needed
+                        keep_ratio=keep_ratio
                     )
                 
                 prune_end = time.time()
@@ -164,10 +230,10 @@ def preprocess_and_cache_pruned_embeddings(
         print(f"✅ Successfully pruned: {successful_prunes} images")
         print(f"❌ Failed to prune: {failed_prunes} images")
         print(f"⏱️  Total pruning time: {total_pruning_time:.2f}s")
-        print(f"⏱️  Average time per image: {total_pruning_time / successful_prunes:.2f}s")
+        print(f"⏱️  Average time per image: {total_pruning_time / successful_prunes:.2f}s" if successful_prunes > 0 else "N/A")
         print("=" * 80)
         
-        return pruned_cache
+        return pruned_cache, total_pruning_time
     
     finally:
         # Clean up models
@@ -200,6 +266,19 @@ def inference_with_cached_embeddings(
         for field_name, field_type in typed_fields:
             placeholder = f"{{{field_type}:{field_name}}}"
             
+            if field_name == "qa_pair_type":
+                qa_pair_type = field_dict.get(field_name, "")
+                answer_options = field_dict.get("answer_options", [])
+                if qa_pair_type in ["closed-ended finite answer set binary visual", "closed-ended finite answer set binary non-visual"]:
+                    system_prompt += "\n\nREMEMBER: Your entire answer must be EXACTLY 'Yes' or 'No' - nothing more, nothing less."
+                elif qa_pair_type in ["closed-ended finite answer set non-binary visual", "closed-ended finite answer set non-binary non-visual"] and len(answer_options) == 4:
+                    system_prompt += "\n\nREMEMBER: Your entire answer must be ONLY the letter(s) of the correct option(s) - e.g., 'A' or 'B,D'."
+                elif qa_pair_type in ["closed-ended infinite answer set visual", "closed-ended infinite answer set non-visual"]:
+                    system_prompt += "\n\nREMEMBER: Your answer must be concise and direct, with no explanatory text."
+                elif qa_pair_type == "unanswerable":
+                    system_prompt += "\n\nREMEMBER: Decide if the question is unanswerable based on the figure and caption. If it is, respond with 'It is not possible to answer this question based only on the provided data.'. If it is not, respond with the correct answer."
+
+
             if field_type == "text":
                 value = field_dict.get(field_name, "")
                 user_prompt = user_prompt.replace(placeholder, str(value))
@@ -219,30 +298,42 @@ def inference_with_cached_embeddings(
     
     # Generate full prompts
     prompts = [
-        _generate_prompt(user_prompt=user_prompt, system_prompt=system_prompt)
+        _generate_prompt(user_prompt=user_prompt, system_prompt=full_system_prompt)
         for user_prompt in user_prompts
     ]
     
     # Send requests to API
     outputs = []
-    if base_url:
-        for i, prompt in enumerate(prompts):
-            response = post_http_request_with_embeds(
-                modelname,
-                [prompt],
-                temperature=0,
-                api_url=(base_url + "/chat/completions"),
-                guided_choice=guided_choice,
-                image_embeddings=[all_pruned_embeddings[i]] if all_pruned_embeddings[i] is not None else None
-            )
-            
-            request_output = json.loads(response.content)
-            choices = request_output.get('choices', [])
-            
-            if choices and 'message' in choices[0] and 'content' in choices[0]['message']:
-                outputs.append(choices[0]['message']['content'])
-            else:
-                outputs.append(None)
+
+    answer_schema = {
+        "type": "object",
+        "properties": {
+            "Answer": {
+                "type": "string"
+            }
+        },
+        "required": ["Answer"]
+    }
+
+    
+    for i, prompt in enumerate(prompts):
+        response = post_http_request_with_embeds(
+            modelname,
+            [prompt],
+            temperature=0,
+            api_url=(base_url + "/chat/completions"),
+            guided_choice=guided_choice,
+            answer_schema=answer_schema,
+            image_embeddings=[all_pruned_embeddings[i]] if all_pruned_embeddings[i] is not None else None
+        )
+        
+        request_output = json.loads(response.content)
+        choices = request_output.get('choices', [])
+        
+        if choices and 'message' in choices[0] and 'content' in choices[0]['message']:
+            outputs.append(choices[0]['message']['content'])
+        else:
+            outputs.append(None)
     
     return outputs
 
@@ -253,11 +344,8 @@ def create_llm_udf_with_cached_embeddings(embedding_cache: Dict[str, Dict], imag
         prompts: pd.Series,
         *args: pd.Series
     ) -> pd.Series:
-        prompt_template = prompts.iloc[0]
-        print(f"Processing batch on PID {os.getpid()} with cached embeddings")
-        
+        prompt_template = prompts.iloc[0]        
         typed_fields = parse_typed_fields(prompt_template)
-        
         if len(args) != len(typed_fields):
             raise ValueError(
                 f"Expected {len(typed_fields)} column(s) for fields {[f[0] for f in typed_fields]}, "
@@ -284,8 +372,7 @@ def create_llm_udf_with_cached_embeddings(embedding_cache: Dict[str, Dict], imag
             typed_fields=typed_fields,
             embedding_cache=embedding_cache,
             image_source_mapping=image_source_mapping,
-            system_prompt=DEFAULT_SYSTEM_PROMPT,
-            guided_choice=["Yes", "No"],
+            system_prompt=full_system_prompt,
             base_url="http://localhost:8000/v1"
         )
         
@@ -298,8 +385,10 @@ def run_experiment_with_cached_embeddings(
     pope_pandas_df: pd.DataFrame,
     pope_spark_df,
     dataset_name: str = "POPE_image_prefix"
-) -> Tuple[str, float]:
-    """Run experiment with cached embeddings for a specific keep_ratio."""
+) -> Tuple[str, float, float]:
+    """Run experiment with cached embeddings for a specific keep_ratio.
+    Returns: (output_path, execution_time, pruning_time)
+    """
     print(f"\n{'='*80}")
     print(f"Running experiment with keep_ratio={keep_ratio}")
     print(f"{'='*80}\n")
@@ -308,18 +397,18 @@ def run_experiment_with_cached_embeddings(
     
     # Preprocess and cache pruned embeddings
     print(f"Preprocessing images with keep_ratio={keep_ratio}...")
-    embedding_cache = preprocess_and_cache_pruned_embeddings(
+    embedding_cache, pruning_time = preprocess_and_cache_pruned_embeddings(
         df=pope_pandas_df,
-        image_column='image',
+        image_column='image_file',
         question_column='question',
-        image_id_column='image_source',
+        image_id_column='figure_id',
         keep_ratio=keep_ratio,
         device='cuda:0'
     )
     
     # Create image source mapping
     image_source_mapping_reordered = {
-        idx: row['image_source'] 
+        idx: row['figure_id'] 
         for idx, row in pope_pandas_df.iterrows()
     }
     
@@ -332,32 +421,42 @@ def run_experiment_with_cached_embeddings(
     
     # Execute query
     result_df = spark.sql("""
-        SELECT 
-            id,
-            question_id,
-            question,
-            answer,
-            image_source,
-            LLM('Given the text: {text:question} and image: {image:image}, give me the answer to the question', question, image) as predicted
-        FROM pope
-    """)
+    SELECT 
+        answer,
+        LLM('
+qa_pair_type: {text:qa_pair_type}
+figure_type: {text:figure_type}
+caption: {text:caption}
+answer_options: {text:answer_options}
+question: {text:question}
+image_file: {image:image_file}
+', image_file, qa_pair_type, figure_type, caption, answer_options, question) as predicted
+    FROM pope
+""")
     
-    # Add comparison column
+    result_df = result_df.withColumn(
+        "predicted",
+        regexp_replace(regexp_replace(col("predicted"), "[\r\n]+", " "), "\\s+", " ")
+    )
+
     result_df_with_comparison = result_df.withColumn(
-        "is_correct",
-        when(
-            lower(trim(col("predicted"))) == lower(trim(col("answer"))),
-            1
-        ).otherwise(0)
-    ).drop("question")
+    "is_correct",
+    when(
+        lower(col("predicted")).contains(lower(trim(col("answer")))),
+        1
+    ).otherwise(0))
     
-    # Write results to CSV
+    # Write results to CSV with semicolon separator
     output_path = f"./{dataset_name}_{keep_ratio}.csv"
-    result_df_with_comparison.coalesce(1).write.mode("overwrite").option("header", "true").csv(output_path)
+    result_df_with_comparison.coalesce(1).write.mode("overwrite") \
+        .option("header", "true") \
+        .option("sep", ";") \
+        .csv(output_path)
     
     end_time = time.time()
     execution_time = end_time - start_time
     print(f"\nExecution time for keep_ratio={keep_ratio}: {execution_time:.2f} seconds")
+    print(f"Pruning time for keep_ratio={keep_ratio}: {pruning_time:.2f} seconds")
     
     # Write execution time to text file
     time_log_path = f"./{dataset_name}_{keep_ratio}_execution_time.txt"
@@ -367,17 +466,19 @@ def run_experiment_with_cached_embeddings(
         f.write(f"Dataset: {dataset_name}\n")
         f.write(f"Keep Ratio: {keep_ratio}\n")
         f.write(f"Total Execution Time: {execution_time:.2f} seconds ({execution_time/60:.2f} minutes)\n")
+        f.write(f"Pruning Time: {pruning_time:.2f} seconds ({pruning_time/60:.2f} minutes)\n")
+        f.write(f"Inference Time: {(execution_time - pruning_time):.2f} seconds ({(execution_time - pruning_time)/60:.2f} minutes)\n")
         f.write(f"Start Time: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(start_time))}\n")
         f.write(f"End Time: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(end_time))}\n")
         f.write(f"{'='*50}\n")
     
     print(f"Execution time logged to: {time_log_path}")
     
-    return output_path, execution_time
+    return output_path, execution_time, pruning_time
 
 
 def calculate_accuracy(csv_path: str, keep_ratio: float) -> float:
-    """Read CSV and calculate accuracy."""
+    """Read CSV with semicolon separator and calculate accuracy."""
     # Find the actual CSV file in the directory (Spark creates a folder)
     if os.path.isdir(csv_path):
         csv_files = [f for f in os.listdir(csv_path) if f.endswith('.csv') and not f.startswith('.')]
@@ -389,8 +490,8 @@ def calculate_accuracy(csv_path: str, keep_ratio: float) -> float:
     else:
         actual_csv = csv_path
     
-    # Read CSV
-    df = pd.read_csv(actual_csv)
+    # Read CSV with semicolon separator
+    df = pd.read_csv(actual_csv, sep=';')
     
     # Calculate accuracy
     total = len(df)
@@ -410,26 +511,31 @@ def calculate_accuracy(csv_path: str, keep_ratio: float) -> float:
 
 # Main execution
 if __name__ == "__main__":
-    keep_ratios = [0.056, 0.111, 0.222]
-    dataset_name = "POPE_grouping"
+    keep_ratios = [1, 0.222, 0.111, 0.056]
+    dataset_name = "SciVQA_image_prefix"
     
     overall_start = time.time()
     
     # Read POPE parquet once
-    POPE_PATH = "/home/haikai/haikai/entropyTest/POPE.parquet"
-    pope_df = spark.read.parquet(POPE_PATH)
+    POPE_PATH = "/home/haikai/train_2025-07-03_09-06.json"
+    pope_df = spark.read \
+        .option("multiLine", "true") \
+        .option("encoding", "UTF-8") \
+        .json(POPE_PATH) \
+        .limit(300) \
+        .cache()
     pope_df.createOrReplaceTempView("pope")
-    print(f"Total records: {pope_df.count()}")
     
     # Convert to pandas once
     pope_pandas_df = pope_df.toPandas()
     
     results = {}
     execution_times = {}
+    pruning_times = {}
     
     # Run experiments for each keep_ratio
     for keep_ratio in keep_ratios:
-        output_path, exec_time = run_experiment_with_cached_embeddings(
+        output_path, exec_time, prune_time = run_experiment_with_cached_embeddings(
             keep_ratio=keep_ratio,
             pope_pandas_df=pope_pandas_df,
             pope_spark_df=pope_df,
@@ -437,6 +543,7 @@ if __name__ == "__main__":
         )
         
         execution_times[keep_ratio] = exec_time
+        pruning_times[keep_ratio] = prune_time
         
         # Calculate accuracy
         accuracy = calculate_accuracy(output_path, keep_ratio)
@@ -445,10 +552,10 @@ if __name__ == "__main__":
         # Clear GPU memory between experiments
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-            print("GPU cache cleared")
     
     overall_end = time.time()
     overall_time = overall_end - overall_start
+    total_pruning_time = sum(pruning_times.values())
     
     # Write summary to text file
     summary_path = f"./{dataset_name}_summary.txt"
@@ -457,20 +564,23 @@ if __name__ == "__main__":
         f.write(f"{'='*80}\n")
         f.write(f"Dataset: {dataset_name}\n")
         f.write(f"Total Overall Execution Time: {overall_time:.2f} seconds ({overall_time/60:.2f} minutes)\n")
+        f.write(f"Total Pruning Time (All Experiments): {total_pruning_time:.2f} seconds ({total_pruning_time/60:.2f} minutes)\n")
+        f.write(f"Total Inference Time (All Experiments): {(overall_time - total_pruning_time):.2f} seconds ({(overall_time - total_pruning_time)/60:.2f} minutes)\n")
         f.write(f"Start Time: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(overall_start))}\n")
         f.write(f"End Time: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(overall_end))}\n")
         f.write(f"\n{'='*80}\n")
         f.write(f"DETAILED RESULTS\n")
         f.write(f"{'='*80}\n\n")
-        f.write(f"{'Keep Ratio':<15} {'Accuracy':<15} {'Exec Time (s)':<20} {'Status':<15}\n")
-        f.write(f"{'-'*65}\n")
+        f.write(f"{'Keep Ratio':<15} {'Accuracy':<15} {'Prune Time (s)':<20} {'Exec Time (s)':<20} {'Status':<15}\n")
+        f.write(f"{'-'*85}\n")
         for keep_ratio in keep_ratios:
             accuracy = results.get(keep_ratio)
             exec_time = execution_times.get(keep_ratio, 0)
+            prune_time = pruning_times.get(keep_ratio, 0)
             if accuracy is not None:
-                f.write(f"{keep_ratio:<15.3f} {accuracy:<15.2f}% {exec_time:<20.2f} {'✓':<15}\n")
+                f.write(f"{keep_ratio:<15.3f} {accuracy:<15.2f}% {prune_time:<20.2f} {exec_time:<20.2f} {'✓':<15}\n")
             else:
-                f.write(f"{keep_ratio:<15.3f} {'N/A':<15} {exec_time:<20.2f} {'✗':<15}\n")
+                f.write(f"{keep_ratio:<15.3f} {'N/A':<15} {prune_time:<20.2f} {exec_time:<20.2f} {'✗':<15}\n")
         f.write(f"{'='*80}\n")
     
     print(f"\nSummary saved to: {summary_path}")
@@ -480,16 +590,19 @@ if __name__ == "__main__":
     print("FINAL SUMMARY")
     print(f"{'='*80}")
     print(f"Dataset: {dataset_name}")
-    print(f"Total execution time: {overall_time:.2f} seconds ({overall_time/60:.2f} minutes)\n")
-    print(f"{'Keep Ratio':<15} {'Accuracy':<15} {'Exec Time (s)':<20} {'Status':<15}")
-    print(f"{'-'*65}")
+    print(f"Total execution time: {overall_time:.2f} seconds ({overall_time/60:.2f} minutes)")
+    print(f"Total pruning time: {total_pruning_time:.2f} seconds ({total_pruning_time/60:.2f} minutes)")
+    print(f"Total inference time: {(overall_time - total_pruning_time):.2f} seconds ({(overall_time - total_pruning_time)/60:.2f} minutes)\n")
+    print(f"{'Keep Ratio':<15} {'Accuracy':<15} {'Prune Time (s)':<20} {'Exec Time (s)':<20} {'Status':<15}")
+    print(f"{'-'*85}")
     for keep_ratio in keep_ratios:
         accuracy = results.get(keep_ratio)
         exec_time = execution_times.get(keep_ratio, 0)
+        prune_time = pruning_times.get(keep_ratio, 0)
         if accuracy is not None:
-            print(f"{keep_ratio:<15.3f} {accuracy:<15.2f}% {exec_time:<20.2f} {'✓':<15}")
+            print(f"{keep_ratio:<15.3f} {accuracy:<15.2f}% {prune_time:<20.2f} {exec_time:<20.2f} {'✓':<15}")
         else:
-            print(f"{keep_ratio:<15.3f} {'N/A':<15} {exec_time:<20.2f} {'✗':<15}")
+            print(f"{keep_ratio:<15.3f} {'N/A':<15} {prune_time:<20.2f} {exec_time:<20.2f} {'✗':<15}")
     print(f"{'='*80}\n")
     
     spark.stop()

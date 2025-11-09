@@ -10,6 +10,7 @@ from pyspark.sql.types import StringType
 from util.mllm import *
 from util.utils import *
 from util.cdencoder import *
+from util.trimTokenator import *
 from util.utils import _generate_prompt
 
 # Get the absolute path of the project root
@@ -37,6 +38,9 @@ spark = SparkSession.builder \
 # Global variables for model configuration
 API_URL = "http://localhost:8000/v1/chat/completions"
 RECOVERY_RATIO = 0.0
+# Assuming DEFAULT_SYSTEM_PROMPT, load_vision_models, cleanup_vision_models, 
+# getOriginalVisualToken, trimTokenatorPruning, parse_typed_fields, 
+# post_http_request_with_embeds are defined elsewhere or are placeholders.
 
 def extract_image_binary_from_pope_data(image_data):
     """Extract image binary from POPE data format."""
@@ -53,11 +57,11 @@ def preprocess_and_cache_pruned_embeddings(
     question_column: str,
     image_id_column: str,
     keep_ratio: float,
-    device: str = 'cuda:0'
-) -> Dict[str, Dict]:
+    device: str = 'cuda'
+) -> Tuple[Dict[str, Dict], float]: # CHANGED: Return type now includes float for total time
     # Load models once for all preprocessing
     print("Loading vision models...")
-    vision_tower, model, _ = load_vision_models(device=device)
+    vision_tower, model, tokenizer = load_vision_models(device=device)
     
     try:
         # Group questions by image
@@ -77,7 +81,7 @@ def preprocess_and_cache_pruned_embeddings(
         print("\n" + "-" * 80)
         
         pruned_cache = {}
-        total_pruning_time = 0
+        total_pruning_time = 0 # This tracks only the actual pruning time
         successful_prunes = 0
         failed_prunes = 0
         
@@ -85,8 +89,8 @@ def preprocess_and_cache_pruned_embeddings(
         for image_idx, (image_id, image_group) in enumerate(image_groups):
             num_questions = len(image_group)
             
-            print(f"\n[{image_idx + 1}/{unique_images}] Processing image: {image_id}")
-            print(f"  Number of questions: {num_questions}")
+            #print(f"\n[{image_idx + 1}/{unique_images}] Processing image: {image_id}")
+            #print(f"  Number of questions: {num_questions}")
             
             try:
                 # Get image data (same for all rows with this image_id)
@@ -104,11 +108,11 @@ def preprocess_and_cache_pruned_embeddings(
                     f"{questions_text}"
                 )
                 
-                print(f"  Combined guidance length: {len(combined_guidance)} chars")
-                print(f"  Sample questions: {all_questions[:2]}...")
+                #print(f"  Combined guidance length: {len(combined_guidance)} chars")
+                #print(f"  Sample questions: {all_questions[:2]}...")
                 
                 # Prune image with combined guidance
-                print(f"  🔧 Pruning image...")
+                #print(f"  🔧 Pruning image...")
                 prune_start = time.time()
                 
                 if keep_ratio == 1:
@@ -120,15 +124,14 @@ def preprocess_and_cache_pruned_embeddings(
                     )
                 else:
                     # Prune with combined guidance
-                    reduced_tokens = getPrunedVisualTokenVisPruner_optimized(
-                        model,
-                        vision_tower,
-                        image_binary,
-                        combined_guidance,
-                        keep_ratio=keep_ratio,
-                        important_ratio=0.6,
-                        recovery_ratio=0.0  # Adjust as needed
-                    )
+                    reduced_tokens = trimTokenatorPruning(
+                                model,
+                                vision_tower,
+                                tokenizer,
+                                image_binary,
+                                combined_guidance, # FIXED: using combined_guidance instead of undefined user_prompt
+                                keep_ratio=keep_ratio
+                            )
                 
                 prune_end = time.time()
                 prune_time = prune_end - prune_start
@@ -146,10 +149,10 @@ def preprocess_and_cache_pruned_embeddings(
                 
                 successful_prunes += 1
                 
-                print(f"  ✅ Pruning successful!")
-                print(f"  📊 Original: 576 tokens → Pruned: {reduced_tokens.shape[1]} tokens")
-                print(f"  📉 Reduction: {((576 - reduced_tokens.shape[1]) / 576 * 100):.1f}%")
-                print(f"  ⏱️  Time: {prune_time:.2f}s")
+                #print(f"  ✅ Pruning successful!")
+                #print(f"  📊 Original: 576 tokens → Pruned: {reduced_tokens.shape[1]} tokens")
+                #print(f"  📉 Reduction: {((576 - reduced_tokens.shape[1]) / 576 * 100):.1f}%")
+                #print(f"  ⏱️  Time: {prune_time:.2f}s")
                 
             except Exception as e:
                 failed_prunes += 1
@@ -163,11 +166,12 @@ def preprocess_and_cache_pruned_embeddings(
         print("=" * 80)
         print(f"✅ Successfully pruned: {successful_prunes} images")
         print(f"❌ Failed to prune: {failed_prunes} images")
-        print(f"⏱️  Total pruning time: {total_pruning_time:.2f}s")
-        print(f"⏱️  Average time per image: {total_pruning_time / successful_prunes:.2f}s")
+        # PRINTED AND RECORDED: Total pruning time for the whole preprocessing step
+        print(f"⏱️  Total pruning time (Sum of individual prune times): {total_pruning_time:.2f}s") 
+        #print(f"⏱️  Average time per image: {total_pruning_time / successful_prunes:.2f}s")
         print("=" * 80)
         
-        return pruned_cache
+        return pruned_cache, total_pruning_time
     
     finally:
         # Clean up models
@@ -298,7 +302,7 @@ def run_experiment_with_cached_embeddings(
     pope_pandas_df: pd.DataFrame,
     pope_spark_df,
     dataset_name: str = "POPE_image_prefix"
-) -> Tuple[str, float]:
+) -> Tuple[str, float, float]: # CHANGED: Return type now includes total_pruning_time
     """Run experiment with cached embeddings for a specific keep_ratio."""
     print(f"\n{'='*80}")
     print(f"Running experiment with keep_ratio={keep_ratio}")
@@ -308,13 +312,14 @@ def run_experiment_with_cached_embeddings(
     
     # Preprocess and cache pruned embeddings
     print(f"Preprocessing images with keep_ratio={keep_ratio}...")
-    embedding_cache = preprocess_and_cache_pruned_embeddings(
+    # CHANGED: Capture both the cache and the total pruning time
+    embedding_cache, total_pruning_time = preprocess_and_cache_pruned_embeddings(
         df=pope_pandas_df,
         image_column='image',
         question_column='question',
         image_id_column='image_source',
         keep_ratio=keep_ratio,
-        device='cuda:0'
+        device='cuda'
     )
     
     # Create image source mapping
@@ -357,7 +362,9 @@ def run_experiment_with_cached_embeddings(
     
     end_time = time.time()
     execution_time = end_time - start_time
+    
     print(f"\nExecution time for keep_ratio={keep_ratio}: {execution_time:.2f} seconds")
+    print(f"Preprocessing (Pruning) time for keep_ratio={keep_ratio}: {total_pruning_time:.2f} seconds")
     
     # Write execution time to text file
     time_log_path = f"./{dataset_name}_{keep_ratio}_execution_time.txt"
@@ -366,14 +373,16 @@ def run_experiment_with_cached_embeddings(
         f.write(f"{'='*50}\n")
         f.write(f"Dataset: {dataset_name}\n")
         f.write(f"Keep Ratio: {keep_ratio}\n")
-        f.write(f"Total Execution Time: {execution_time:.2f} seconds ({execution_time/60:.2f} minutes)\n")
+        f.write(f"Total Execution Time (Prep + Inference): {execution_time:.2f} seconds ({execution_time/60:.2f} minutes)\n")
+        f.write(f"Preprocessing (Pruning) Time: {total_pruning_time:.2f} seconds\n") # ADDED
         f.write(f"Start Time: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(start_time))}\n")
         f.write(f"End Time: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(end_time))}\n")
         f.write(f"{'='*50}\n")
     
     print(f"Execution time logged to: {time_log_path}")
     
-    return output_path, execution_time
+    # CHANGED: Return the total pruning time as well
+    return output_path, execution_time, total_pruning_time
 
 
 def calculate_accuracy(csv_path: str, keep_ratio: float) -> float:
@@ -410,7 +419,7 @@ def calculate_accuracy(csv_path: str, keep_ratio: float) -> float:
 
 # Main execution
 if __name__ == "__main__":
-    keep_ratios = [0.056, 0.111, 0.222]
+    keep_ratios = [1, 0.056, 0.111, 0.222]
     dataset_name = "POPE_grouping"
     
     overall_start = time.time()
@@ -426,10 +435,12 @@ if __name__ == "__main__":
     
     results = {}
     execution_times = {}
+    preprocessing_times = {} # ADDED: Dictionary to store preprocessing times
     
     # Run experiments for each keep_ratio
     for keep_ratio in keep_ratios:
-        output_path, exec_time = run_experiment_with_cached_embeddings(
+        # CHANGED: Capture the new total_pruning_time return value
+        output_path, exec_time, prep_time = run_experiment_with_cached_embeddings(
             keep_ratio=keep_ratio,
             pope_pandas_df=pope_pandas_df,
             pope_spark_df=pope_df,
@@ -437,6 +448,7 @@ if __name__ == "__main__":
         )
         
         execution_times[keep_ratio] = exec_time
+        preprocessing_times[keep_ratio] = prep_time # ADDED
         
         # Calculate accuracy
         accuracy = calculate_accuracy(output_path, keep_ratio)
@@ -462,15 +474,19 @@ if __name__ == "__main__":
         f.write(f"\n{'='*80}\n")
         f.write(f"DETAILED RESULTS\n")
         f.write(f"{'='*80}\n\n")
-        f.write(f"{'Keep Ratio':<15} {'Accuracy':<15} {'Exec Time (s)':<20} {'Status':<15}\n")
-        f.write(f"{'-'*65}\n")
+        # CHANGED: Added 'Prep Time (s)' to the header
+        f.write(f"{'Keep Ratio':<15} {'Accuracy':<15} {'Total Time (s)':<20} {'Prep Time (s)':<20} {'Status':<15}\n") 
+        f.write(f"{'-'*85}\n")
         for keep_ratio in keep_ratios:
             accuracy = results.get(keep_ratio)
             exec_time = execution_times.get(keep_ratio, 0)
+            prep_time = preprocessing_times.get(keep_ratio, 0) # ADDED
             if accuracy is not None:
-                f.write(f"{keep_ratio:<15.3f} {accuracy:<15.2f}% {exec_time:<20.2f} {'✓':<15}\n")
+                # CHANGED: Added prep_time to the output
+                f.write(f"{keep_ratio:<15.3f} {accuracy:<15.2f}% {exec_time:<20.2f} {prep_time:<20.2f} {'✓':<15}\n")
             else:
-                f.write(f"{keep_ratio:<15.3f} {'N/A':<15} {exec_time:<20.2f} {'✗':<15}\n")
+                # CHANGED: Added prep_time to the output
+                f.write(f"{keep_ratio:<15.3f} {'N/A':<15} {exec_time:<20.2f} {prep_time:<20.2f} {'✗':<15}\n")
         f.write(f"{'='*80}\n")
     
     print(f"\nSummary saved to: {summary_path}")
@@ -481,15 +497,19 @@ if __name__ == "__main__":
     print(f"{'='*80}")
     print(f"Dataset: {dataset_name}")
     print(f"Total execution time: {overall_time:.2f} seconds ({overall_time/60:.2f} minutes)\n")
-    print(f"{'Keep Ratio':<15} {'Accuracy':<15} {'Exec Time (s)':<20} {'Status':<15}")
-    print(f"{'-'*65}")
+    # CHANGED: Added 'Prep Time (s)' to the console header
+    print(f"{'Keep Ratio':<15} {'Accuracy':<15} {'Total Time (s)':<20} {'Prep Time (s)':<20} {'Status':<15}")
+    print(f"{'-'*85}")
     for keep_ratio in keep_ratios:
         accuracy = results.get(keep_ratio)
         exec_time = execution_times.get(keep_ratio, 0)
+        prep_time = preprocessing_times.get(keep_ratio, 0) # ADDED
         if accuracy is not None:
-            print(f"{keep_ratio:<15.3f} {accuracy:<15.2f}% {exec_time:<20.2f} {'✓':<15}")
+            # CHANGED: Added prep_time to the console output
+            print(f"{keep_ratio:<15.3f} {accuracy:<15.2f}% {exec_time:<20.2f} {prep_time:<20.2f} {'✓':<15}")
         else:
-            print(f"{keep_ratio:<15.3f} {'N/A':<15} {exec_time:<20.2f} {'✗':<15}")
+            # CHANGED: Added prep_time to the console output
+            print(f"{keep_ratio:<15.3f} {'N/A':<15} {exec_time:<20.2f} {prep_time:<20.2f} {'✗':<15}")
     print(f"{'='*80}\n")
     
     spark.stop()

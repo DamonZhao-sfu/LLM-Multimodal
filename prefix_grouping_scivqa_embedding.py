@@ -704,7 +704,7 @@ def preprocess_and_cache_pruned_embeddings(
     """Returns pruned cache and total pruning time."""
     # Load models once for all preprocessing
     print("Loading vision models...")
-    vision_tower, model = load_vision_models(device=device)
+    vision_tower, model, _ = load_vision_models(device=device)
     
     try:
         # Group questions by image
@@ -904,7 +904,7 @@ def inference_with_cached_embeddings(
                 temperature=0,
                 api_url=(base_url + "/chat/completions"),
                 guided_choice=guided_choice,
-                answer_schema=answer_schema
+                answer_schema=answer_schema,
                 image_embeddings=[all_pruned_embeddings[i]] if all_pruned_embeddings[i] is not None else None
             )
             
