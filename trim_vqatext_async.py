@@ -3,6 +3,8 @@ import os
 import time
 import pandas as pd
 from typing import Tuple, List, Dict, Any, Callable
+from pyspark.sql.functions import array_contains, lower, trim, col, when, expr, regexp_replace, get_json_object
+
 import json
 import asyncio
 
@@ -105,6 +107,13 @@ def execute_batch_pope_with_pruned_embeddings(
                         else:
                             # Time the pruning operation
                             pruning_start = time.time()
+                            # reduced_tokens = getCDPrunedVisualToken(
+                            #     model,
+                            #     vision_tower,
+                            #     image_binary,
+                            #     user_prompt,
+                            #     keep_ratio=keep_ratio
+                            # )
                             reduced_tokens = trimTokenatorPruning(
                                 model,
                                 vision_tower,
@@ -127,6 +136,12 @@ def execute_batch_pope_with_pruned_embeddings(
         prompts = [_generate_prompt(user_prompt=user_prompt, system_prompt=system_prompt) 
                    for user_prompt in user_prompts]
         
+        answer_schema = {
+            "type": "object",
+            "properties": {"Answer": {"type": "string"}},
+            "required": ["Answer"]
+        }
+
         outputs = []
         if base_url:            
             async def fetch_all():
@@ -135,8 +150,6 @@ def execute_batch_pope_with_pruned_embeddings(
                 """
                 tasks = []
                 for i, prompt in enumerate(prompts):
-                    # Use asyncio.to_thread to run the synchronous 
-                    # post_http_request_with_embeds in a separate thread.
                     task = asyncio.to_thread(
                         post_http_request_with_embeds,
                         modelname,
@@ -144,6 +157,7 @@ def execute_batch_pope_with_pruned_embeddings(
                         temperature=0,
                         api_url=(base_url + "/chat/completions"),
                         guided_choice=guided_choice,
+                        answer_schema=answer_schema,
                         image_embeddings=[all_pruned_embeddings[i]] if all_pruned_embeddings[i] is not None else None
                     )
                     tasks.append(task)
@@ -229,7 +243,6 @@ def create_llm_udf_with_embeddings(
             typed_fields=typed_fields,
             reordered_columns=reordered_columns,
             system_prompt=DEFAULT_SYSTEM_PROMPT,
-            guided_choice=["Yes", "No"],
             base_url="http://localhost:8000/v1"
         )
         
@@ -269,35 +282,48 @@ def run_experiment(keep_ratio: float, dataset_name: str = "POPE_random") -> Tupl
     spark.udf.register("LLM", llm_udf)
     
     # Read POPE parquet
-    POPE_PATH = "/home/haikai/haikai/entropyTest/POPE.parquet"
-    pope_df = spark.read.parquet(POPE_PATH)
+    POPE_PATH = "/home/haikai/LLM-Multimodal/VQAtext/validation-00000-of-00003.parquet"
+    pope_df = spark.read.parquet(POPE_PATH).limit(30)
     pope_df.createOrReplaceTempView("pope")
-    print(f"Total records: {pope_df.count()}")
     
     # Execute query with proper column references
     result_df = spark.sql("""
         SELECT 
-            id,
-            question_id,
-            question,
-            answer,
-            image_source,
-            LLM('Given the text: {text:question} and image: {image:image} give me the answer to the question', question, image) as predicted
+            answers,
+            LLM('Given the question: {text:question} and image: {image:image}, give me the answer to the question', question, image) as predicted
         FROM pope
     """)
     
-    # Normalize both answer and predicted columns for comparison
-    result_df_with_comparison = result_df.withColumn(
+    # Clean the predicted column to remove newlines and extra whitespace
+    result_df_cleaned = result_df.withColumn(
+        "predicted",
+        regexp_replace(col("predicted"), r"[\n\r]+", " ")  # Replace newlines with space
+    ).withColumn(
+        "predicted",
+        regexp_replace(col("predicted"), r"\s+", " ")  # Replace multiple spaces with single space
+    ).withColumn(
+        "predicted",
+        trim(col("predicted"))  # Trim leading/trailing whitespace
+    )
+
+    result_df_with_comparison = result_df_cleaned.withColumn(
+        "answer_text",
+        lower(trim(get_json_object(col("predicted"), "$.Answer")))
+    ).withColumn(
         "is_correct",
         when(
-            lower(trim(col("predicted"))) == lower(trim(col("answer"))),
+            expr("exists(answers, x -> lower(trim(answer_text)) like concat('%', lower(trim(x)), '%'))"),
             1
         ).otherwise(0)
-    ).drop("question")
+    ).drop("answer_text", "answers")
     
-    # Write results to CSV
+    # Write results to CSV with proper escaping
     output_path = f"./{dataset_name}_{keep_ratio}.csv"
-    result_df_with_comparison.coalesce(1).write.mode("overwrite").option("header", "true").csv(output_path)
+    result_df_with_comparison.coalesce(1).write.mode("overwrite") \
+        .option("header", "true") \
+        .option("quote", '"') \
+        .option("escape", '"') \
+        .csv(output_path)
     
     end_time = time.time()
     execution_time = end_time - start_time
@@ -364,7 +390,7 @@ def calculate_accuracy(csv_path: str, keep_ratio: float) -> float:
 # Main execution
 if __name__ == "__main__":
     keep_ratios = [1, 0.056, 0.111, 0.222]
-    dataset_name = "POPE_cdprune"
+    dataset_name = "vqatext_trim"
     
     overall_start = time.time()
     results = {}

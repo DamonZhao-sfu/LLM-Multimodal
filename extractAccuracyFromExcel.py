@@ -64,9 +64,10 @@ def calculate_accuracy_from_directories(directories):
 def main():
     # Example usage - modify these directories as needed
     directories = [
-        "/scratch/hpc-prf-haqc/haikai/LLM-Multimodal/VQA_image_nonprefix_0.056.csv",
-        "/scratch/hpc-prf-haqc/haikai/LLM-Multimodal/VQA_image_nonprefix_0.111.csv",
-        "/scratch/hpc-prf-haqc/haikai/LLM-Multimodal/VQA_image_nonprefix_0.222.csv"
+        "/home/haikai/LLM-Multimodal/SciVQA_image_cdpruner_0.056.csv",
+        "/home/haikai/LLM-Multimodal/SciVQA_image_cdpruner_0.111.csv",
+        "/home/haikai/LLM-Multimodal/SciVQA_image_cdpruner_0.222.csv",
+        "/home/haikai/LLM-Multimodal/SciVQA_image_cdpruner_1.csv",
     ]
     
     print("="*80)

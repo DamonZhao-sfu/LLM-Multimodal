@@ -105,14 +105,21 @@ def execute_batch_pope_with_pruned_embeddings(
                         else:
                             # Time the pruning operation
                             pruning_start = time.time()
-                            reduced_tokens = trimTokenatorPruning(
+                            reduced_tokens = getCDPrunedVisualToken(
                                 model,
                                 vision_tower,
-                                tokenizer,
                                 image_binary,
                                 user_prompt,
                                 keep_ratio=keep_ratio
                             )
+                            # reduced_tokens = trimTokenatorPruning(
+                            #     model,
+                            #     vision_tower,
+                            #     tokenizer,
+                            #     image_binary,
+                            #     user_prompt,
+                            #     keep_ratio=keep_ratio
+                            # )
                             pruning_end = time.time()
                             batch_pruning_time += (pruning_end - pruning_start)
                             
@@ -229,7 +236,6 @@ def create_llm_udf_with_embeddings(
             typed_fields=typed_fields,
             reordered_columns=reordered_columns,
             system_prompt=DEFAULT_SYSTEM_PROMPT,
-            guided_choice=["Yes", "No"],
             base_url="http://localhost:8000/v1"
         )
         
@@ -269,31 +275,25 @@ def run_experiment(keep_ratio: float, dataset_name: str = "POPE_random") -> Tupl
     spark.udf.register("LLM", llm_udf)
     
     # Read POPE parquet
-    POPE_PATH = "/home/haikai/haikai/entropyTest/POPE.parquet"
-    pope_df = spark.read.parquet(POPE_PATH)
+    POPE_PATH = "/home/haikai/LLM-Multimodal/chartQA/test-00000-of-00001.parquet"
+    pope_df = spark.read.parquet(POPE_PATH).limit(30)
     pope_df.createOrReplaceTempView("pope")
-    print(f"Total records: {pope_df.count()}")
     
     # Execute query with proper column references
     result_df = spark.sql("""
         SELECT 
-            id,
-            question_id,
-            question,
             answer,
-            image_source,
-            LLM('Given the text: {text:question} and image: {image:image} give me the answer to the question', question, image) as predicted
+            LLM('Given the text: {text:question} image: {image:image}, give me the answer to the question', question, image) as predicted
         FROM pope
     """)
     
-    # Normalize both answer and predicted columns for comparison
+    # Add comparison column
     result_df_with_comparison = result_df.withColumn(
-        "is_correct",
-        when(
-            lower(trim(col("predicted"))) == lower(trim(col("answer"))),
-            1
-        ).otherwise(0)
-    ).drop("question")
+    "is_correct",
+    when(
+        lower(col("predicted")).contains(lower(trim(col("answer")))),
+        1
+    ).otherwise(0))
     
     # Write results to CSV
     output_path = f"./{dataset_name}_{keep_ratio}.csv"
@@ -364,7 +364,7 @@ def calculate_accuracy(csv_path: str, keep_ratio: float) -> float:
 # Main execution
 if __name__ == "__main__":
     keep_ratios = [1, 0.056, 0.111, 0.222]
-    dataset_name = "POPE_cdprune"
+    dataset_name = "chartqa_trim"
     
     overall_start = time.time()
     results = {}

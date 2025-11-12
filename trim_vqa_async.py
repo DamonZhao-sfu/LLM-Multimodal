@@ -229,7 +229,6 @@ def create_llm_udf_with_embeddings(
             typed_fields=typed_fields,
             reordered_columns=reordered_columns,
             system_prompt=DEFAULT_SYSTEM_PROMPT,
-            guided_choice=["Yes", "No"],
             base_url="http://localhost:8000/v1"
         )
         
@@ -269,31 +268,25 @@ def run_experiment(keep_ratio: float, dataset_name: str = "POPE_random") -> Tupl
     spark.udf.register("LLM", llm_udf)
     
     # Read POPE parquet
-    POPE_PATH = "/home/haikai/haikai/entropyTest/POPE.parquet"
+    POPE_PATH = "/home/haikai/LLM-Multimodal/VQAv2/validation-00000-of-00068.parquet"
     pope_df = spark.read.parquet(POPE_PATH)
     pope_df.createOrReplaceTempView("pope")
-    print(f"Total records: {pope_df.count()}")
     
     # Execute query with proper column references
     result_df = spark.sql("""
         SELECT 
-            id,
-            question_id,
-            question,
-            answer,
-            image_source,
-            LLM('Given the text: {text:question} and image: {image:image} give me the answer to the question', question, image) as predicted
+            multiple_choice_answer,
+            LLM('Given the question: {text:question} and candidate answers {text:answers} and {text:answer_type} and image: {image:image}, give me the answer to the question', question, answers, answer_type, image) as predicted
         FROM pope
     """)
     
-    # Normalize both answer and predicted columns for comparison
+    # Add comparison column
     result_df_with_comparison = result_df.withColumn(
-        "is_correct",
-        when(
-            lower(trim(col("predicted"))) == lower(trim(col("answer"))),
-            1
-        ).otherwise(0)
-    ).drop("question")
+    "is_correct",
+    when(
+        lower(col("predicted")).contains(lower(trim(col("multiple_choice_answer")))),
+        1
+    ).otherwise(0)).drop("predicted")
     
     # Write results to CSV
     output_path = f"./{dataset_name}_{keep_ratio}.csv"
@@ -364,7 +357,7 @@ def calculate_accuracy(csv_path: str, keep_ratio: float) -> float:
 # Main execution
 if __name__ == "__main__":
     keep_ratios = [1, 0.056, 0.111, 0.222]
-    dataset_name = "POPE_cdprune"
+    dataset_name = "vqav2_trim"
     
     overall_start = time.time()
     results = {}
