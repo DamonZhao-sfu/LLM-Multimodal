@@ -283,7 +283,7 @@ def run_experiment(keep_ratio: float, dataset_name: str = "POPE_random") -> Tupl
     
     # Read POPE parquet
     POPE_PATH = "/home/haikai/LLM-Multimodal/VQAtext/validation-00000-of-00003.parquet"
-    pope_df = spark.read.parquet(POPE_PATH).limit(30)
+    pope_df = spark.read.parquet(POPE_PATH)
     pope_df.createOrReplaceTempView("pope")
     
     # Execute query with proper column references
