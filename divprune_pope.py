@@ -141,14 +141,6 @@ def execute_batch_pope_with_pruned_embeddings(
 def create_llm_udf_with_embeddings(
     keep_ratio: float
 ):
-    """
-    Create UDF with optional reordering function.
-    
-    Args:
-        keep_ratio: Token keep ratio for pruning
-        reorder_function: Optional function that takes a DataFrame and returns 
-                         (reordered_df, column_order_list)
-    """
     @pandas_udf(StringType())
     def llm_udf_embedding_batch(
         prompts: pd.Series,

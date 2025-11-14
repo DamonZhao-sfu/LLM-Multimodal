@@ -2,6 +2,7 @@ import sys
 import os
 import time
 import pandas as pd
+import csv
 from typing import Tuple, List, Dict, Any, Callable
 from pyspark.sql.functions import array_contains, lower, trim, col, when, expr, regexp_replace, get_json_object
 
@@ -45,8 +46,46 @@ spark = SparkSession.builder \
 API_URL = "http://localhost:8000/v1/chat/completions"
 RECOVERY_RATIO = 0.0
 
-# Global variable to track pruning time
-TOTAL_PRUNING_TIME = 0.0
+# Global variables to track timing and CSV file
+TIMING_CSV_FILE = None
+INVOCATION_COUNTER = 0
+
+
+def initialize_timing_csv(keep_ratio: float, dataset_name: str):
+    """Initialize CSV file for timing records."""
+    global TIMING_CSV_FILE, INVOCATION_COUNTER
+    
+    INVOCATION_COUNTER = 0
+    TIMING_CSV_FILE = f"./{dataset_name}_{keep_ratio}_timing.csv"
+    
+    # Create CSV with headers
+    with open(TIMING_CSV_FILE, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(['invocation_id', 'keep_ratio', 'preprocess_time', 'encode_time', 'prune_time', 'total_time'])
+    
+    print(f"Timing CSV initialized: {TIMING_CSV_FILE}")
+
+
+def record_timing(keep_ratio: float, preprocess_time: float, encode_time: float, prune_time: float):
+    """Record timing information to CSV file."""
+    global TIMING_CSV_FILE, INVOCATION_COUNTER
+    
+    if TIMING_CSV_FILE is None:
+        return
+    
+    INVOCATION_COUNTER += 1
+    total_time = preprocess_time + encode_time + prune_time
+    
+    with open(TIMING_CSV_FILE, 'a', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            INVOCATION_COUNTER,
+            keep_ratio,
+            f"{preprocess_time:.6f}",
+            f"{encode_time:.6f}",
+            f"{prune_time:.6f}",
+            f"{total_time:.6f}"
+        ])
 
 
 def execute_batch_pope_with_pruned_embeddings(
@@ -59,17 +98,15 @@ def execute_batch_pope_with_pruned_embeddings(
     system_prompt: str = DEFAULT_SYSTEM_PROMPT,
     guided_choice: List[str] = None,
     base_url: str = "http://localhost:8000/v1",
-) -> Tuple[List[str], float]:
-    """Returns: (outputs, accumulated_pruning_time)"""
+) -> List[str]:
+    """Returns: outputs"""
     vision_tower, model, tokenizer = load_vision_models(device='cuda')
-    batch_pruning_time = 0.0  # Track pruning time for this batch
     
     try:
         # Build user prompts and generate pruned embeddings
         user_prompts = []
         all_pruned_embeddings = []
         
-
         for field_dict in fields:
             # Initialize prompt with empty string - we'll build it from scratch
             user_prompt = ""
@@ -98,25 +135,24 @@ def execute_batch_pope_with_pruned_embeddings(
                         image_binary = extract_image_binary_from_pope_data(image_data)
                         
                         if keep_ratio == 1:
-                            reduced_tokens = getOriginalVisualToken(
+                            reduced_tokens, preprocess_time, encode_time  = getOriginalVisualToken(
                                 model,
                                 vision_tower,
                                 image_binary
                             )
-           
+                            # Record timing with zeros for no pruning
+                            record_timing(keep_ratio, preprocess_time, encode_time, 0.0)
                         else:
                             # Time the pruning operation
-                            pruning_start = time.time()
-                            reduced_tokens = trimTokenatorPruning(
+                            reduced_tokens, preprocess_time, encode_time, prune_time = getCDPrunedVisualToken(
                                 model,
                                 vision_tower,
-                                tokenizer,
                                 image_binary,
                                 user_prompt,
                                 keep_ratio=keep_ratio
                             )
-                            pruning_end = time.time()
-                            batch_pruning_time += (pruning_end - pruning_start)
+                            # Record timing for this invocation
+                            record_timing(keep_ratio, preprocess_time, encode_time, prune_time)
                             
                         pruned_embeddings_for_this_prompt.append(reduced_tokens.to(torch.float16))
             
@@ -143,6 +179,8 @@ def execute_batch_pope_with_pruned_embeddings(
                 """
                 tasks = []
                 for i, prompt in enumerate(prompts):
+                    # Use asyncio.to_thread to run the synchronous 
+                    # post_http_request_with_embeds in a separate thread.
                     task = asyncio.to_thread(
                         post_http_request_with_embeds,
                         modelname,
@@ -182,7 +220,7 @@ def execute_batch_pope_with_pruned_embeddings(
             # Run the async main function from our synchronous context
             # This will block until all concurrent requests are complete
             outputs = asyncio.run(fetch_all())            
-            return outputs, batch_pruning_time
+            return outputs
     
     finally:
         torch.cuda.empty_cache()
@@ -196,8 +234,6 @@ def create_llm_udf_with_embeddings(
         prompts: pd.Series,
         *args: pd.Series
     ) -> pd.Series:      
-        global TOTAL_PRUNING_TIME
-        
         print(f"Batch size: {len(prompts)}")  
         prompt_template = prompts.iloc[0]
         typed_fields = parse_typed_fields(prompt_template)
@@ -223,12 +259,11 @@ def create_llm_udf_with_embeddings(
         merged_df = pd.DataFrame(data_dict)
         
         reordered_columns = list(merged_df.columns)
-            
         
         # Convert to records for processing
         fields_list = merged_df.to_dict('records')
         
-        outputs, batch_pruning_time = execute_batch_pope_with_pruned_embeddings(
+        outputs = execute_batch_pope_with_pruned_embeddings(
             modelname="/data/models/llava-1.5-7b-hf",
             fields=fields_list,
             query=prompt_template,
@@ -238,11 +273,7 @@ def create_llm_udf_with_embeddings(
             system_prompt=DEFAULT_SYSTEM_PROMPT,
             base_url="http://localhost:8000/v1"
         )
-        
-        # Accumulate pruning time
-        TOTAL_PRUNING_TIME += batch_pruning_time
-        print(f"Batch pruning time: {batch_pruning_time:.2f}s, Total pruning time so far: {TOTAL_PRUNING_TIME:.2f}s")
-        
+                
         return pd.Series(outputs)
     
     return llm_udf_embedding_batch
@@ -259,14 +290,12 @@ def run_experiment(keep_ratio: float, dataset_name: str = "POPE_random") -> Tupl
     """Run experiment with specific keep_ratio and save results.
     Returns: (output_path, execution_time, pruning_time)
     """
-    global TOTAL_PRUNING_TIME
-    
     print(f"\n{'='*80}")
     print(f"Running experiment with keep_ratio={keep_ratio}")
     print(f"{'='*80}\n")
     
-    # Reset pruning time for this experiment
-    TOTAL_PRUNING_TIME = 0.0
+    # Initialize timing CSV for this experiment
+    initialize_timing_csv(keep_ratio, dataset_name)
     
     start_time = time.time()
     
@@ -276,7 +305,7 @@ def run_experiment(keep_ratio: float, dataset_name: str = "POPE_random") -> Tupl
     
     # Read POPE parquet
     POPE_PATH = "/home/haikai/LLM-Multimodal/VQAtext/validation-00000-of-00003.parquet"
-    pope_df = spark.read.parquet(POPE_PATH)
+    pope_df = spark.read.parquet(POPE_PATH).coalesce(1)
     pope_df.createOrReplaceTempView("pope")
     
     # Execute query with proper column references
@@ -310,7 +339,7 @@ def run_experiment(keep_ratio: float, dataset_name: str = "POPE_random") -> Tupl
         ).otherwise(0)
     ).drop("answer_text", "answers")
     
-    # Write results to CSV with proper escaping
+    # Write results to CSV
     output_path = f"./{dataset_name}_{keep_ratio}.csv"
     result_df_with_comparison.coalesce(1).write.mode("overwrite") \
         .option("header", "true") \
@@ -321,10 +350,14 @@ def run_experiment(keep_ratio: float, dataset_name: str = "POPE_random") -> Tupl
     end_time = time.time()
     execution_time = end_time - start_time
     pruning_time = 0
+    if TIMING_CSV_FILE and os.path.exists(TIMING_CSV_FILE):
+        timing_df = pd.read_csv(TIMING_CSV_FILE)
+        pruning_time = timing_df['total_time'].sum()
     
     print(f"\nExecution time for keep_ratio={keep_ratio}: {execution_time:.2f} seconds")
     print(f"Pruning time for keep_ratio={keep_ratio}: {pruning_time:.2f} seconds")
     print(f"Pruning percentage: {pruning_time/execution_time*100:.2f}%")
+    print(f"Total invocations: {INVOCATION_COUNTER}")
     
     # Write execution time to text file
     time_log_path = f"./{dataset_name}_{keep_ratio}_execution_time.txt"
@@ -333,16 +366,20 @@ def run_experiment(keep_ratio: float, dataset_name: str = "POPE_random") -> Tupl
         f.write(f"{'='*50}\n")
         f.write(f"Dataset: {dataset_name}\n")
         f.write(f"Keep Ratio: {keep_ratio}\n")
+        f.write(f"Total Invocations: {INVOCATION_COUNTER}\n")
         f.write(f"Total Execution Time: {execution_time:.2f} seconds ({execution_time/60:.2f} minutes)\n")
         f.write(f"Total Pruning Time: {pruning_time:.2f} seconds ({pruning_time/60:.2f} minutes)\n")
         f.write(f"Pruning Time Percentage: {pruning_time/execution_time*100:.2f}%\n")
         f.write(f"Start Time: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(start_time))}\n")
         f.write(f"End Time: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(end_time))}\n")
+        f.write(f"Timing CSV: {TIMING_CSV_FILE}\n")
         f.write(f"{'='*50}\n")
     
     print(f"Execution time logged to: {time_log_path}")
+    print(f"Detailed timing logged to: {TIMING_CSV_FILE}")
     
     return output_path, execution_time, pruning_time
+
 
 def calculate_accuracy(csv_path: str, keep_ratio: float) -> float:
     """Read CSV and calculate accuracy."""
@@ -380,10 +417,50 @@ def calculate_accuracy(csv_path: str, keep_ratio: float) -> float:
     return accuracy
 
 
+def generate_timing_summary(keep_ratios: List[float], dataset_name: str):
+    """Generate summary statistics from all timing CSV files."""
+    summary_path = f"./{dataset_name}_timing_summary.txt"
+    
+    with open(summary_path, 'w') as f:
+        f.write(f"TIMING SUMMARY\n")
+        f.write(f"{'='*100}\n\n")
+        
+        for keep_ratio in keep_ratios:
+            timing_csv = f"./{dataset_name}_{keep_ratio}_timing.csv"
+            
+            if not os.path.exists(timing_csv):
+                continue
+            
+            df = pd.read_csv(timing_csv)
+            
+            f.write(f"Keep Ratio: {keep_ratio}\n")
+            f.write(f"{'-'*100}\n")
+            f.write(f"Total Invocations: {len(df)}\n")
+            f.write(f"\nPreprocess Time:\n")
+            f.write(f"  Mean: {df['preprocess_time'].mean():.6f}s, Median: {df['preprocess_time'].median():.6f}s\n")
+            f.write(f"  Min: {df['preprocess_time'].min():.6f}s, Max: {df['preprocess_time'].max():.6f}s\n")
+            f.write(f"  Total: {df['preprocess_time'].sum():.6f}s\n")
+            f.write(f"\nEncode Time:\n")
+            f.write(f"  Mean: {df['encode_time'].mean():.6f}s, Median: {df['encode_time'].median():.6f}s\n")
+            f.write(f"  Min: {df['encode_time'].min():.6f}s, Max: {df['encode_time'].max():.6f}s\n")
+            f.write(f"  Total: {df['encode_time'].sum():.6f}s\n")
+            f.write(f"\nPrune Time:\n")
+            f.write(f"  Mean: {df['prune_time'].mean():.6f}s, Median: {df['prune_time'].median():.6f}s\n")
+            f.write(f"  Min: {df['prune_time'].min():.6f}s, Max: {df['prune_time'].max():.6f}s\n")
+            f.write(f"  Total: {df['prune_time'].sum():.6f}s\n")
+            f.write(f"\nTotal Time:\n")
+            f.write(f"  Mean: {df['total_time'].mean():.6f}s, Median: {df['total_time'].median():.6f}s\n")
+            f.write(f"  Min: {df['total_time'].min():.6f}s, Max: {df['total_time'].max():.6f}s\n")
+            f.write(f"  Total: {df['total_time'].sum():.6f}s\n")
+            f.write(f"\n{'='*100}\n\n")
+    
+    print(f"Timing summary saved to: {summary_path}")
+
+
 # Main execution
 if __name__ == "__main__":
     keep_ratios = [1, 0.056, 0.111, 0.222]
-    dataset_name = "vqatext_trim"
+    dataset_name = "vqatext_cdpruner"
     
     overall_start = time.time()
     results = {}
@@ -405,6 +482,9 @@ if __name__ == "__main__":
     overall_end = time.time()
     overall_time = overall_end - overall_start
     total_pruning_time = sum(pruning_times.values())
+    
+    # Generate timing summary
+    generate_timing_summary(keep_ratios, dataset_name)
     
     # Write summary to text file
     summary_path = f"./{dataset_name}_summary.txt"

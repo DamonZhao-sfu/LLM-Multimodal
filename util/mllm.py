@@ -171,14 +171,17 @@ def call_vllm_api_with_embeds(image_embedding, question="What's in this image?",
 
 def getOriginalVisualToken(model, vision_tower, image_binary):
     
+    preprocess_start = time.time()   
     image = Image.open(io.BytesIO(image_binary))
     inputs = vision_tower.image_processor(image, return_tensors="pt")
     images = inputs["pixel_values"]
+    preprocess_end = time.time()   
+    preprocess_time = preprocess_end - preprocess_start
+
     image_stream = torch.cuda.Stream()
     
     model_device = vision_tower.device
-    
-    # Process image features
+    encode_begin = time.time()
     with torch.cuda.stream(image_stream):
         image_forward_outs = vision_tower.vision_tower(
             images.to(device=model_device, dtype=vision_tower.dtype),
@@ -192,10 +195,10 @@ def getOriginalVisualToken(model, vision_tower, image_binary):
     image_features = image_features.to(device=model_device, dtype=torch.float16)
     model.multi_modal_projector = model.multi_modal_projector.to(model_device)
     image_features = model.multi_modal_projector(image_features).detach().cpu() 
+    encode_end = time.time()
+    encode_time = encode_end - encode_begin
 
-    # mm_projector = nn.Linear(1024, 4096).to(device=model_device, dtype=torch.float16)
-    # image_features = mm_projector(image_features)
-    return image_features
+    return image_features,preprocess_time,encode_time
 
 
 def process_text_efficiently(texts, vision_tower, model_device):
@@ -323,21 +326,22 @@ def similarity_based_duplicate_removal_fast(features, num_to_keep):
 
 def getPrunedVisualTokenVisPruner_optimized(model, vision_tower, image_binary, texts, keep_ratio=0.125, 
                                           important_ratio=0.6, recovery_ratio=0.1, text_guidance_weight=0.5):
+    preprocess_start = time.time()   
     image = Image.open(io.BytesIO(image_binary))
     inputs = vision_tower.image_processor(image, return_tensors="pt")
     images = inputs["pixel_values"]
+    preprocess_end = time.time()   
+    preprocess_time = preprocess_end - preprocess_start
     
+    encode_begin = time.time()
     model_device = vision_tower.device
     dtype = vision_tower.dtype
-    
-    # Process image features and get attention from visual encoder
     with torch.no_grad():
         image_forward_outs = vision_tower.vision_tower(
             images.to(device=model_device, dtype=dtype),
             output_hidden_states=True,
             output_attentions=True
         )
-        
         # Extract [CLS] attention more efficiently
         attentions = image_forward_outs.attentions
         if len(attentions) > 1:
@@ -350,11 +354,13 @@ def getPrunedVisualTokenVisPruner_optimized(model, vision_tower, image_binary, t
         image_features = image_outputs.to(dtype)  # Keep on GPU
     
     B, N, C = image_features.shape
-    
-    # Ensure consistent dtypes - convert image_features to float16 and projector to same device/dtype
     image_features = image_features.to(device=model_device, dtype=torch.float16)
     model.multi_modal_projector = model.multi_modal_projector.to(device=model_device, dtype=torch.float16)
     projected_features = model.multi_modal_projector(image_features)  # [B, N, hidden_dim]
+    encode_end = time.time()
+    encode_time = encode_end - encode_begin
+
+    prune_begin = time.time()
 
     # Pre-calculate token counts to avoid repeated calculations
     num_tokens_to_keep = min(int(keep_ratio * N), N)
@@ -374,7 +380,6 @@ def getPrunedVisualTokenVisPruner_optimized(model, vision_tower, image_binary, t
     all_mask[important_indices] = False
     remaining_indices = torch.nonzero(all_mask, as_tuple=True)[0]
     
-    begin = time.time()
     # Step 2: Optimized diverse token selection
     diverse_indices = torch.empty(0, dtype=torch.long, device=model_device)
     
@@ -422,7 +427,6 @@ def getPrunedVisualTokenVisPruner_optimized(model, vision_tower, image_binary, t
     # Extract selected features
     image_features_selected = projected_features[:, selected_indices, :]
     
-    end = time.time()
     if texts is not None and recovery_ratio > 0:
         # Process text more efficiently
         text_embeds = process_text_efficiently(texts, vision_tower, model_device)
@@ -460,13 +464,11 @@ def getPrunedVisualTokenVisPruner_optimized(model, vision_tower, image_binary, t
                     image_features_selected = torch.cat(
                         [image_features_selected, image_features_recovered], dim=1
                     )
-    # Single GPU-CPU transfer at the end
     result = image_features_selected.detach().cpu()
-    
-    #print(f"Final output shape: {result.shape}")
-    #print(f"Kept {result.shape[1]} out of {N} tokens ({result.shape[1]/N*100:.1f}%)")
-    
-    return result
+    prune_end = time.time()
+    prune_time = prune_end-prune_begin
+
+    return result, preprocess_time, encode_time, prune_time
 
 def post_http_request_with_embeds(
     model: str,
@@ -477,23 +479,6 @@ def post_http_request_with_embeds(
     image_embeddings: List[torch.Tensor] = None,
     answer_schema: Optional[Dict[str, Any]] = None,  # Optional JSON schema parameter
 ) -> requests.Response:
-    """
-    Send HTTP POST request with embeddings and optional structured output.
-    
-    Args:
-        model: Model name
-        prompts: List of prompt strings
-        temperature: Sampling temperature
-        api_url: API endpoint URL
-        guided_choice: Optional guided choice list
-        image_embeddings: Optional list of image embedding tensors
-        answer_schema: Optional JSON schema for guided_json (vLLM structured outputs)
-                      If None, no structured output is used.
-                      Example: {"type": "object", "properties": {"Answer": {"type": "string"}}, "required": ["Answer"]}
-    
-    Returns:
-        requests.Response object
-    """
     messages_list = []
     
     for i, prompt in enumerate(prompts):
