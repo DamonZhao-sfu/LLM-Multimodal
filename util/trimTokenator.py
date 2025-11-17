@@ -67,34 +67,40 @@ def trimTokenatorPruning(model, vision_tower, tokenizer, image_binary, texts, ke
     """
     
     # Parse image
+    preprocess_start = time.time()   
     image = Image.open(io.BytesIO(image_binary))
     inputs = vision_tower.image_processor(image, return_tensors="pt")
     images = inputs["pixel_values"]
-    
+    preprocess_end = time.time()   
+    preprocess_time = preprocess_end - preprocess_start
+
+    encode_begin = time.time()
     model_device = vision_tower.device
-    
+
     # Extract visual features
     image_forward_outs = vision_tower.vision_tower(
         images.to(device=model_device, dtype=vision_tower.dtype), 
-        output_hidden_states=True
+        output_hidden_states=True, output_attentions=True
     )
     image_outputs = vision_tower.feature_select(image_forward_outs)
     image_features = image_outputs.to(images.dtype)
-    
     B, N, C = image_features.shape
     
-    # Calculate N1 (tokens after stage 1) and N2 (final tokens)
-    N1 = int(stage1_ratio * N)
-    N2 = int(keep_ratio * N)
-    
+
     # Project visual features
     image_features = image_features.to(device=model_device, dtype=torch.float16)
     model.multi_modal_projector = model.multi_modal_projector.to(model_device)
     image_features = model.multi_modal_projector(image_features)
+    encode_end = time.time()
+    encode_time = encode_end - encode_begin
     
     # ============================================================================
     # STAGE 1: Cross-Modal Alignment (Mutual Information via L2 norm)
     # ============================================================================
+    prune_begin = time.time()
+    # Calculate N1 (tokens after stage 1) and N2 (final tokens)
+    N1 = int(stage1_ratio * N)
+    N2 = int(keep_ratio * N)
     
     if texts is not None:
         # Encode text
@@ -137,9 +143,6 @@ def trimTokenatorPruning(model, vision_tower, tokenizer, image_binary, texts, ke
     
     # Normalize tokens for cosine similarity computation
     X_v1_norm = X_v1 / (X_v1.norm(dim=-1, keepdim=True) + 1e-8)
-    
-    # Compute cosine similarity matrix: C_ij = (x_i^T x_j) / (||x_i|| ||x_j||)
-    #C = torch.matmul(X_v1_norm, X_v1_norm.transpose(1, 2))  # [B, N1, N1]
     
     C = torch.matmul(
         X_v1_norm, 
@@ -195,8 +198,9 @@ def trimTokenatorPruning(model, vision_tower, tokenizer, image_binary, texts, ke
     # Sort indices to maintain spatial order (optional, improves interpretability)
     final_original_indices_sorted, sort_order = torch.sort(final_original_indices, dim=1)
     X_v2_sorted = X_v2[batch_indices_final, sort_order]
-    
+    print(X_v2_sorted.shape)
     # Move to CPU and detach
     result = X_v2_sorted.detach().cpu()
-    
-    return result
+    prune_end = time.time()
+    prune_time = prune_end-prune_begin
+    return result, preprocess_time, encode_time, prune_time

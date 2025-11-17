@@ -2,12 +2,15 @@ import sys
 import os
 import time
 import pandas as pd
+import csv
 from typing import Tuple, List, Dict, Any, Callable
+from pyspark.sql.functions import array_contains, lower, trim, col, when, expr, regexp_replace, get_json_object
+
 import json
 import asyncio
 
 from util.utils import _generate_prompt
-import csv
+
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import pandas_udf, col, when, lower, trim
 from pyspark.sql.types import StringType
@@ -21,7 +24,7 @@ from util.trimTokenator import *
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "./"))
 sys.path.insert(0, project_root)
 
-
+TIMING_CSV_FILE = None
 # Spark configuration
 spark = SparkSession.builder \
     .appName("LLM SQL Test") \
@@ -32,6 +35,7 @@ spark = SparkSession.builder \
     .config("spark.dynamicAllocation.enabled", "false") \
     .config("spark.default.parallelism", "1") \
     .config("spark.sql.shuffle.partitions", "1") \
+    .config("spark.sql.execution.arrow.maxRecordsPerBatch", "50000") \
     .config("spark.driver.maxResultSize", "4g") \
     .config("spark.sql.execution.arrow.pyspark.enabled", "true") \
     .config("spark.executor.memoryOverhead", "16g") \
@@ -42,10 +46,6 @@ spark = SparkSession.builder \
 # Global variables for model configuration
 API_URL = "http://localhost:8000/v1/chat/completions"
 RECOVERY_RATIO = 0.0
-
-# Global variable to track pruning time
-TOTAL_PRUNING_TIME = 0.0
-
 
 def initialize_timing_csv(keep_ratio: float, dataset_name: str):
     """Initialize CSV file for timing records."""
@@ -82,27 +82,26 @@ def record_timing(keep_ratio: float, preprocess_time: float, encode_time: float,
             f"{total_time:.6f}"
         ])
 
+
 def execute_batch_pope_with_pruned_embeddings(
     modelname: str,
     fields: List[Dict[str, Any]],
     query: str,
     keep_ratio: float,
     typed_fields: List[Tuple[str, str]],
-    reordered_columns: List[str],
+    reordered_columns: List[str],  # NEW: List of columns in reordered sequence
     system_prompt: str = DEFAULT_SYSTEM_PROMPT,
     guided_choice: List[str] = None,
     base_url: str = "http://localhost:8000/v1",
-) -> Tuple[List[str], float]:
-    """Returns: (outputs, accumulated_pruning_time)"""
-    vision_tower, model, tokenizer = load_vision_models(device='cuda')
-    batch_pruning_time = 0.0  # Track pruning time for this batch
+) -> List[str]:
+    # Load models at the beginning
+    vision_tower, model, _ = load_vision_models(device='cuda:0')
     
     try:
         # Build user prompts and generate pruned embeddings
         user_prompts = []
         all_pruned_embeddings = []
         
-
         for field_dict in fields:
             # Initialize prompt with empty string - we'll build it from scratch
             user_prompt = ""
@@ -139,7 +138,6 @@ def execute_batch_pope_with_pruned_embeddings(
                             record_timing(keep_ratio, preprocess_time, encode_time, 0.0)
 
                         else:
-                            # Time the pruning operation
                             reduced_tokens, preprocess_time, encode_time, prune_time = getPrunedVisualTokenVisPruner_optimized(
                                 model,
                                 vision_tower,
@@ -149,6 +147,7 @@ def execute_batch_pope_with_pruned_embeddings(
                             )
                             record_timing(keep_ratio, preprocess_time, encode_time, prune_time)
 
+                        
                         pruned_embeddings_for_this_prompt.append(reduced_tokens.to(torch.float16))
             
             user_prompts.append(user_prompt.strip())  # Remove trailing newline
@@ -205,24 +204,31 @@ def execute_batch_pope_with_pruned_embeddings(
             # Run the async main function from our synchronous context
             # This will block until all concurrent requests are complete
             outputs = asyncio.run(fetch_all())            
-            return outputs, batch_pruning_time
+            return outputs
     
     finally:
-        torch.cuda.empty_cache()
+        # Always clean up models, even if an error occurred
+        cleanup_vision_models(vision_tower, model)
 
 
 def create_llm_udf_with_embeddings(
     keep_ratio: float
 ):
+    """
+    Create UDF with optional reordering function.
+    
+    Args:
+        keep_ratio: Token keep ratio for pruning
+        reorder_function: Optional function that takes a DataFrame and returns 
+                         (reordered_df, column_order_list)
+    """
     @pandas_udf(StringType())
     def llm_udf_embedding_batch(
         prompts: pd.Series,
         *args: pd.Series
-    ) -> pd.Series:      
-        global TOTAL_PRUNING_TIME
-        
-        print(f"Batch size: {len(prompts)}")  
+    ) -> pd.Series:        
         prompt_template = prompts.iloc[0]
+        print(f"Processing batch on PID {os.getpid()} with keep_ratio={keep_ratio}")
         typed_fields = parse_typed_fields(prompt_template)
 
         if len(args) != len(typed_fields):
@@ -246,24 +252,22 @@ def create_llm_udf_with_embeddings(
         merged_df = pd.DataFrame(data_dict)
         
         reordered_columns = list(merged_df.columns)
-    
+            
+        
         # Convert to records for processing
         fields_list = merged_df.to_dict('records')
         
-        outputs, batch_pruning_time = execute_batch_pope_with_pruned_embeddings(
+        outputs = execute_batch_pope_with_pruned_embeddings(
             modelname="/data/models/llava-1.5-7b-hf",
             fields=fields_list,
             query=prompt_template,
             keep_ratio=keep_ratio,
             typed_fields=typed_fields,
-            reordered_columns=reordered_columns,
+            reordered_columns=reordered_columns,  # Pass reordered column sequence
             system_prompt=DEFAULT_SYSTEM_PROMPT,
+            guided_choice=["Yes", "No"],
             base_url="http://localhost:8000/v1"
         )
-        
-        # Accumulate pruning time
-        TOTAL_PRUNING_TIME += batch_pruning_time
-        print(f"Batch pruning time: {batch_pruning_time:.2f}s, Total pruning time so far: {TOTAL_PRUNING_TIME:.2f}s")
         
         return pd.Series(outputs)
     
@@ -277,16 +281,13 @@ def extract_image_binary_from_pope_data(image_data):
     return image_data
 
 
-def run_experiment(keep_ratio: float, dataset_name: str = "POPE_random") -> Tuple[str, float, float]:
-    """Run experiment with specific keep_ratio and save results.
-    Returns: (output_path, execution_time, pruning_time)
-    """
+def run_experiment(keep_ratio: float, dataset_name: str = "POPE_random") -> Tuple[str, float]:
+    """Run experiment with specific keep_ratio and save results."""
+    initialize_timing_csv(keep_ratio, dataset_name)
+
     print(f"\n{'='*80}")
     print(f"Running experiment with keep_ratio={keep_ratio}")
     print(f"{'='*80}\n")
-    
-    # Initialize timing CSV for this experiment
-    initialize_timing_csv(keep_ratio, dataset_name)
     
     start_time = time.time()
     
@@ -295,26 +296,31 @@ def run_experiment(keep_ratio: float, dataset_name: str = "POPE_random") -> Tupl
     spark.udf.register("LLM", llm_udf)
     
     # Read POPE parquet
-    POPE_PATH = "/home/haikai/LLM-Multimodal/VQAv2/validation-00000-of-00068.parquet"
+    POPE_PATH = "/home/haikai/haikai/entropyTest/POPE.parquet"
     pope_df = spark.read.parquet(POPE_PATH)
     pope_df.createOrReplaceTempView("pope")
+    print(f"Total records: {pope_df.count()}")
     
     # Execute query with proper column references
     result_df = spark.sql("""
         SELECT 
-            multiple_choice_answer,
-            LLM('Given the question: {text:question} and candidate answers {text:answers} and {text:answer_type} and image: {image:image}, give me the answer to the question', question, answers, answer_type, image) as predicted
+            id,
+            question_id,
+            question,
+            answer,
+            image_source,
+            LLM('Given the text: {text:question} and image: {image:image} give me the answer to the question', question, image) as predicted
         FROM pope
     """)
     
-    # Add comparison column
+    # Normalize both answer and predicted columns for comparison
     result_df_with_comparison = result_df.withColumn(
         "is_correct",
         when(
-            lower(col("predicted")).contains(lower(trim(col("multiple_choice_answer")))),
+            lower(trim(col("predicted"))) == lower(trim(col("answer"))),
             1
         ).otherwise(0)
-    ).drop("predicted")
+    ).drop("question")
     
     # Write results to CSV
     output_path = f"./{dataset_name}_{keep_ratio}.csv"
@@ -323,7 +329,6 @@ def run_experiment(keep_ratio: float, dataset_name: str = "POPE_random") -> Tupl
     end_time = time.time()
     execution_time = end_time - start_time
     
-    # Calculate pruning time from timing CSV
     pruning_time = 0
     if TIMING_CSV_FILE and os.path.exists(TIMING_CSV_FILE):
         timing_df = pd.read_csv(TIMING_CSV_FILE)
@@ -333,7 +338,7 @@ def run_experiment(keep_ratio: float, dataset_name: str = "POPE_random") -> Tupl
     print(f"Pruning time for keep_ratio={keep_ratio}: {pruning_time:.2f} seconds")
     print(f"Pruning percentage: {pruning_time/execution_time*100:.2f}%")
     print(f"Total invocations: {INVOCATION_COUNTER}")
-    
+
     # Write execution time to text file
     time_log_path = f"./{dataset_name}_{keep_ratio}_execution_time.txt"
     with open(time_log_path, 'w') as f:
@@ -341,17 +346,12 @@ def run_experiment(keep_ratio: float, dataset_name: str = "POPE_random") -> Tupl
         f.write(f"{'='*50}\n")
         f.write(f"Dataset: {dataset_name}\n")
         f.write(f"Keep Ratio: {keep_ratio}\n")
-        f.write(f"Total Invocations: {INVOCATION_COUNTER}\n")
         f.write(f"Total Execution Time: {execution_time:.2f} seconds ({execution_time/60:.2f} minutes)\n")
-        f.write(f"Total Pruning Time: {pruning_time:.2f} seconds ({pruning_time/60:.2f} minutes)\n")
-        f.write(f"Pruning Time Percentage: {pruning_time/execution_time*100:.2f}%\n")
         f.write(f"Start Time: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(start_time))}\n")
         f.write(f"End Time: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(end_time))}\n")
-        f.write(f"Timing CSV: {TIMING_CSV_FILE}\n")
         f.write(f"{'='*50}\n")
     
     print(f"Execution time logged to: {time_log_path}")
-    print(f"Detailed timing logged to: {TIMING_CSV_FILE}")
     
     return output_path, execution_time, pruning_time
 
@@ -369,11 +369,7 @@ def calculate_accuracy(csv_path: str, keep_ratio: float) -> float:
         actual_csv = csv_path
     
     # Read CSV
-    try:
-        df = pd.read_csv(actual_csv)
-    except FileNotFoundError:
-        print(f"Warning: CSV file not found at {actual_csv}")
-        return None
+    df = pd.read_csv(actual_csv)
     
     # Calculate accuracy
     total = len(df)
@@ -393,14 +389,13 @@ def calculate_accuracy(csv_path: str, keep_ratio: float) -> float:
 
 # Main execution
 if __name__ == "__main__":
-    keep_ratios = [1, 0.056, 0.111, 0.222]
-    dataset_name = "vqav2_vispruner"
+    keep_ratios = [0.056, 0.111, 0.222]
+    dataset_name = "POPE_visPruner"
     
     overall_start = time.time()
     results = {}
     execution_times = {}
     pruning_times = {}
-    
     for keep_ratio in keep_ratios:
         output_path, exec_time, prune_time = run_experiment(
             keep_ratio, 
@@ -409,13 +404,12 @@ if __name__ == "__main__":
         
         execution_times[keep_ratio] = exec_time
         pruning_times[keep_ratio] = prune_time
-        
+
         accuracy = calculate_accuracy(output_path, keep_ratio)
         results[keep_ratio] = accuracy
     
     overall_end = time.time()
     overall_time = overall_end - overall_start
-    total_pruning_time = sum(pruning_times.values())
     
     # Write summary to text file
     summary_path = f"./{dataset_name}_summary.txt"
@@ -424,24 +418,20 @@ if __name__ == "__main__":
         f.write(f"{'='*80}\n")
         f.write(f"Dataset: {dataset_name}\n")
         f.write(f"Total Overall Execution Time: {overall_time:.2f} seconds ({overall_time/60:.2f} minutes)\n")
-        f.write(f"Total Accumulated Pruning Time: {total_pruning_time:.2f} seconds ({total_pruning_time/60:.2f} minutes)\n")
-        f.write(f"Pruning Time Percentage: {total_pruning_time/overall_time*100:.2f}%\n")
         f.write(f"Start Time: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(overall_start))}\n")
         f.write(f"End Time: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(overall_end))}\n")
         f.write(f"\n{'='*80}\n")
         f.write(f"DETAILED RESULTS\n")
         f.write(f"{'='*80}\n\n")
-        f.write(f"{'Keep Ratio':<12} {'Accuracy':<12} {'Exec Time (s)':<15} {'Prune Time (s)':<16} {'Prune %':<10} {'Status':<10}\n")
-        f.write(f"{'-'*80}\n")
+        f.write(f"{'Keep Ratio':<15} {'Accuracy':<15} {'Exec Time (s)':<20} {'Status':<15}\n")
+        f.write(f"{'-'*65}\n")
         for keep_ratio in keep_ratios:
             accuracy = results.get(keep_ratio)
             exec_time = execution_times.get(keep_ratio, 0)
-            prune_time = pruning_times.get(keep_ratio, 0)
-            prune_pct = (prune_time / exec_time * 100) if exec_time > 0 else 0.0
             if accuracy is not None:
-                f.write(f"{keep_ratio:<12.3f} {accuracy:<12.2f}% {exec_time:<15.2f} {prune_time:<16.2f} {prune_pct:<10.2f}% {'✓':<10}\n")
+                f.write(f"{keep_ratio:<15.3f} {accuracy:<15.2f}% {exec_time:<20.2f} {'✓':<15}\n")
             else:
-                f.write(f"{keep_ratio:<12.3f} {'N/A':<12} {exec_time:<15.2f} {prune_time:<16.2f} {prune_pct:<10.2f}% {'✗':<10}\n")
+                f.write(f"{keep_ratio:<15.3f} {'N/A':<15} {exec_time:<20.2f} {'✗':<15}\n")
         f.write(f"{'='*80}\n")
     
     print(f"\nSummary saved to: {summary_path}")
@@ -451,20 +441,16 @@ if __name__ == "__main__":
     print("FINAL SUMMARY")
     print(f"{'='*80}")
     print(f"Dataset: {dataset_name}")
-    print(f"Total execution time: {overall_time:.2f} seconds ({overall_time/60:.2f} minutes)")
-    print(f"Total pruning time: {total_pruning_time:.2f} seconds ({total_pruning_time/60:.2f} minutes)")
-    print(f"Pruning time percentage: {total_pruning_time/overall_time*100:.2f}%\n")
-    print(f"{'Keep Ratio':<12} {'Accuracy':<12} {'Exec Time (s)':<15} {'Prune Time (s)':<16} {'Prune %':<10} {'Status':<10}")
-    print(f"{'-'*80}")
+    print(f"Total execution time: {overall_time:.2f} seconds ({overall_time/60:.2f} minutes)\n")
+    print(f"{'Keep Ratio':<15} {'Accuracy':<15} {'Exec Time (s)':<20} {'Status':<15}")
+    print(f"{'-'*65}")
     for keep_ratio in keep_ratios:
         accuracy = results.get(keep_ratio)
         exec_time = execution_times.get(keep_ratio, 0)
-        prune_time = pruning_times.get(keep_ratio, 0)
-        prune_pct = (prune_time / exec_time * 100) if exec_time > 0 else 0.0
         if accuracy is not None:
-            print(f"{keep_ratio:<12.3f} {accuracy:<12.2f}% {exec_time:<15.2f} {prune_time:<16.2f} {prune_pct:<10.2f}% {'✓':<10}")
+            print(f"{keep_ratio:<15.3f} {accuracy:<15.2f}% {exec_time:<20.2f} {'✓':<15}")
         else:
-            print(f"{keep_ratio:<12.3f} {'N/A':<12} {exec_time:<15.2f} {prune_time:<16.2f} {prune_pct:<10.2f}% {'✗':<10}")
+            print(f"{keep_ratio:<15.3f} {'N/A':<15} {exec_time:<20.2f} {'✗':<15}")
     print(f"{'='*80}\n")
     
     spark.stop()

@@ -13,6 +13,8 @@ from util.utils import *
 from util.cdencoder import *
 from util.utils import _generate_prompt
 from util.trimTokenator import *
+from util.trimWithTextFusion import *
+
 import json
 import asyncio
 import csv
@@ -162,13 +164,15 @@ def preprocess_and_cache_pruned_embeddings(
     
                 else:
                     # Prune with combined guidance
-                    reduced_tokens, preprocess_time, encode_time, prune_time = trimTokenatorPruning(
+                    reduced_tokens, preprocess_time, encode_time, prune_time = enhanced_trimTokenator_multi_question(
                                 model,
                                 vision_tower,
                                 tokenizer,
                                 image_binary,
-                                combined_guidance,
-                                keep_ratio=keep_ratio
+                                all_questions,
+                                keep_ratio=keep_ratio,
+                                # "attention_weighted", "max_pooling", "adaptive"
+                                fusion_method="adaptive"
                     )
                     record_timing(keep_ratio, preprocess_time, encode_time, prune_time) 
                 
@@ -502,7 +506,7 @@ def calculate_accuracy(csv_path: str, keep_ratio: float) -> float:
 
 # Main execution
 if __name__ == "__main__":
-    keep_ratios = [1, 0.222, 0.111, 0.056]
+    keep_ratios = [0.222, 0.111, 0.056]
     dataset_name = "textvqa_trim_grouping"
     
     overall_start = time.time()

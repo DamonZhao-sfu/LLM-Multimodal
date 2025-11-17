@@ -10,7 +10,7 @@ data = {
     'Token Preserve Percentage': ['100%', '22.2%', '11.1%', '5.6%', '100%', '22.2%', '11.1%', '5.6%',
                                    '100%', '22.2%', '11.1%', '5.6%', '100%', '22.2%', '11.1%', '5.6%'],
     'Accuracy': [78.27, 78.87, 77.23,74.47, 79.20, 79.60, 76.60, 72.9, 82.23, 80.43, 76.3, 69.2, 79.2, 79.5, 74.6, 64.7],
-    'Strategy': ['Pruned']*4 + ['Pruned + V1']*4 + ['Pruned+Grouping']*4 + ['Pruned+V1+Grouping']*4
+    'Strategy': ['VisPruner']*4 + ['VisPruner + V1']*4 + ['VisPruner+Grouping']*4 + ['VisPruner+V1+Grouping']*4
 }
 
 df = pd.DataFrame(data)

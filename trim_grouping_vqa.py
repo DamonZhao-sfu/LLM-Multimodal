@@ -4,6 +4,8 @@ import time
 import pandas as pd
 import torch
 import asyncio
+import json
+import csv
 from typing import Dict, List, Tuple, Any
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import regexp_replace, col, when, lower, trim
@@ -40,6 +42,43 @@ spark = SparkSession.builder \
 # Global variables for model configuration
 API_URL = "http://localhost:8000/v1/chat/completions"
 RECOVERY_RATIO = 0.0
+
+def initialize_timing_csv(keep_ratio: float, dataset_name: str):
+    """Initialize CSV file for timing records."""
+    global TIMING_CSV_FILE, INVOCATION_COUNTER
+    
+    INVOCATION_COUNTER = 0
+    TIMING_CSV_FILE = f"./{dataset_name}_{keep_ratio}_timing.csv"
+    
+    # Create CSV with headers
+    with open(TIMING_CSV_FILE, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(['invocation_id', 'keep_ratio', 'preprocess_time', 'encode_time', 'prune_time', 'total_time'])
+    
+    print(f"Timing CSV initialized: {TIMING_CSV_FILE}")
+
+
+def record_timing(keep_ratio: float, preprocess_time: float, encode_time: float, prune_time: float):
+    """Record timing information to CSV file."""
+    global TIMING_CSV_FILE, INVOCATION_COUNTER
+    
+    if TIMING_CSV_FILE is None:
+        return
+    
+    INVOCATION_COUNTER += 1
+    total_time = preprocess_time + encode_time + prune_time
+    
+    with open(TIMING_CSV_FILE, 'a', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            INVOCATION_COUNTER,
+            keep_ratio,
+            f"{preprocess_time:.6f}",
+            f"{encode_time:.6f}",
+            f"{prune_time:.6f}",
+            f"{total_time:.6f}"
+        ])
+
 
 def extract_image_binary_from_pope_data(image_data):
     """Extract image binary from POPE data format."""
@@ -107,30 +146,30 @@ def preprocess_and_cache_pruned_embeddings(
                     f"{questions_text}"
                 )
                 
-                #print(f"  Combined guidance length: {len(combined_guidance)} chars")
-                #print(f"  Sample questions: {all_questions[:2]}...")
-                
-                # Prune image with combined guidance
-                #print(f"  🔧 Pruning image...")
                 prune_start = time.time()
                 
                 if keep_ratio == 1:
                     # No pruning, use original tokens
-                    reduced_tokens = getOriginalVisualToken(
-                        model,
-                        vision_tower,
-                        image_binary
+                    reduced_tokens, preprocess_time, encode_time  = getOriginalVisualToken(
+                                model,
+                                vision_tower,
+                                image_binary
                     )
+                    # Record timing with zeros for no pruning
+                    record_timing(keep_ratio, preprocess_time, encode_time, 0.0)
+    
                 else:
                     # Prune with combined guidance
-                    reduced_tokens = trimTokenatorPruning(
-                        model,
-                        vision_tower,
-                        tokenizer,
-                        image_binary,
-                        combined_guidance,
-                        keep_ratio=keep_ratio
+                    reduced_tokens, preprocess_time, encode_time, prune_time = trimTokenatorPruning(
+                                model,
+                                vision_tower,
+                                tokenizer,
+                                image_binary,
+                                combined_guidance,
+                                keep_ratio=keep_ratio
                     )
+                    record_timing(keep_ratio, preprocess_time, encode_time, prune_time) 
+                
                 
                 prune_end = time.time()
                 prune_time = prune_end - prune_start
@@ -148,11 +187,6 @@ def preprocess_and_cache_pruned_embeddings(
                 
                 successful_prunes += 1
                 
-                # print(f"  ✅ Pruning successful!")
-                # print(f"  📊 Original: 576 tokens → Pruned: {reduced_tokens.shape[1]} tokens")
-                # print(f"  📉 Reduction: {((576 - reduced_tokens.shape[1]) / 576 * 100):.1f}%")
-                # print(f"  ⏱️  Time: {prune_time:.2f}s")
-                
             except Exception as e:
                 failed_prunes += 1
                 print(f"  ❌ Error pruning image {image_id}: {e}")
@@ -160,14 +194,6 @@ def preprocess_and_cache_pruned_embeddings(
                 traceback.print_exc()
                 continue
         
-        # print("\n" + "=" * 80)
-        # print("PREPROCESSING COMPLETE")
-        # print("=" * 80)
-        # print(f"✅ Successfully pruned: {successful_prunes} images")
-        # print(f"❌ Failed to prune: {failed_prunes} images")
-        print(f"⏱️  Total pruning time: {total_pruning_time:.2f}s")
-        # print(f"⏱️  Average time per image: {total_pruning_time / successful_prunes:.2f}s" if successful_prunes > 0 else "N/A")
-        # print("=" * 80)
         
         return pruned_cache, total_pruning_time
     
@@ -228,24 +254,6 @@ def inference_with_cached_embeddings(
     # Send requests to API
     outputs = []
     
-    # for i, prompt in enumerate(prompts):
-    #     response = post_http_request_with_embeds(
-    #         modelname,
-    #         [prompt],
-    #         temperature=0,
-    #         api_url=(base_url + "/chat/completions"),
-    #         guided_choice=guided_choice,
-    #         answer_schema=answer_schema,
-    #         image_embeddings=[all_pruned_embeddings[i]] if all_pruned_embeddings[i] is not None else None
-    #     )
-        
-    #     request_output = json.loads(response.content)
-    #     choices = request_output.get('choices', [])
-        
-    #     if choices and 'message' in choices[0] and 'content' in choices[0]['message']:
-    #         outputs.append(choices[0]['message']['content'])
-    #     else:
-    #         outputs.append(None)
     async def fetch_all():
         tasks = []
         for i, prompt in enumerate(prompts):
@@ -342,7 +350,7 @@ def run_experiment_with_cached_embeddings(
     print(f"\n{'='*80}")
     print(f"Running experiment with keep_ratio={keep_ratio}")
     print(f"{'='*80}\n")
-    
+    initialize_timing_csv(keep_ratio, dataset_name)
     start_time = time.time()
     
     # Preprocess and cache pruned embeddings

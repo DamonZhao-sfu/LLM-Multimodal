@@ -177,21 +177,17 @@ def getOriginalVisualToken(model, vision_tower, image_binary):
     images = inputs["pixel_values"]
     preprocess_end = time.time()   
     preprocess_time = preprocess_end - preprocess_start
-
-    image_stream = torch.cuda.Stream()
     
-    model_device = vision_tower.device
     encode_begin = time.time()
-    with torch.cuda.stream(image_stream):
-        image_forward_outs = vision_tower.vision_tower(
-            images.to(device=model_device, dtype=vision_tower.dtype),
-            output_hidden_states=True,
-            output_attentions=True
-        )
-        image_outputs = vision_tower.feature_select(image_forward_outs)
-        image_features = image_outputs.to(images.dtype)
-      
-    torch.cuda.synchronize()
+    model_device = vision_tower.device
+
+    image_forward_outs = vision_tower.vision_tower(
+        images.to(device=model_device, dtype=vision_tower.dtype),
+        output_hidden_states=True,
+        output_attentions=True
+    )
+    image_outputs = vision_tower.feature_select(image_forward_outs)
+    image_features = image_outputs.to(images.dtype)
     image_features = image_features.to(device=model_device, dtype=torch.float16)
     model.multi_modal_projector = model.multi_modal_projector.to(model_device)
     image_features = model.multi_modal_projector(image_features).detach().cpu() 

@@ -26,14 +26,12 @@ def getCDPrunedVisualToken(model, vision_tower, image_binary, texts, keep_ratio=
     preprocess_time = preprocess_end - preprocess_start
 
     encode_begin = time.time()
-    image_stream = torch.cuda.Stream()
-    text_stream = torch.cuda.Stream()
+  
     model_device = vision_tower.device
-    with torch.cuda.stream(image_stream):
-        image_forward_outs = vision_tower.vision_tower(images.to(device=model_device, dtype=vision_tower.dtype), output_hidden_states=True)
-        image_outputs = vision_tower.feature_select(image_forward_outs)
-        image_features = image_outputs.to(images.dtype)
-    
+    image_forward_outs = vision_tower.vision_tower(images.to(device=model_device, dtype=vision_tower.dtype), output_hidden_states=True)
+    image_outputs = vision_tower.feature_select(image_forward_outs)
+    image_features = image_outputs.to(images.dtype)
+
     image_embeds = vision_tower.vision_tower.vision_model.post_layernorm(image_outputs)
     image_embeds = vision_tower.vision_tower.visual_projection(image_embeds.float())
     B, N, C = image_features.shape
@@ -46,17 +44,16 @@ def getCDPrunedVisualToken(model, vision_tower, image_binary, texts, keep_ratio=
 
     prune_begin = time.time()
     if texts is not None:
-        with torch.cuda.stream(text_stream):
-            text_inputs = vision_tower.text_tokenizer(text=texts, return_tensors="pt")
-            text_segment = (text_inputs.input_ids.shape[1] - 1) // vision_tower.max_position_embeddings + 1
-            text_padding = vision_tower.max_position_embeddings * text_segment - text_inputs.input_ids.shape[1]
-            text_inputs = {
-                k: torch.cat([v, v.new_zeros((v.shape[0], text_padding))], 
-                                dim=1).reshape(-1, vision_tower.max_position_embeddings).to(device=vision_tower.device)
-                for k, v in text_inputs.items()
-            }
-            text_embeds = vision_tower.text_tower(**text_inputs).text_embeds
-            text_embeds = text_embeds.to(device=model_device)
+        text_inputs = vision_tower.text_tokenizer(text=texts, return_tensors="pt")
+        text_segment = (text_inputs.input_ids.shape[1] - 1) // vision_tower.max_position_embeddings + 1
+        text_padding = vision_tower.max_position_embeddings * text_segment - text_inputs.input_ids.shape[1]
+        text_inputs = {
+            k: torch.cat([v, v.new_zeros((v.shape[0], text_padding))], 
+                            dim=1).reshape(-1, vision_tower.max_position_embeddings).to(device=vision_tower.device)
+            for k, v in text_inputs.items()
+        }
+        text_embeds = vision_tower.text_tower(**text_inputs).text_embeds
+        text_embeds = text_embeds.to(device=model_device)
 
     # Calculate cosine similarity
     image_normalized = image_features / image_features.norm(dim=-1, keepdim=True)

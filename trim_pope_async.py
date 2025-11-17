@@ -5,7 +5,7 @@ import pandas as pd
 from typing import Tuple, List, Dict, Any, Callable
 import json
 import asyncio
-
+import csv
 from util.utils import _generate_prompt
 
 from pyspark.sql import SparkSession
@@ -45,7 +45,44 @@ RECOVERY_RATIO = 0.0
 
 # Global variable to track pruning time
 TOTAL_PRUNING_TIME = 0.0
+TIMING_CSV_FILE = None
+INVOCATION_COUNTER = 0
 
+def initialize_timing_csv(keep_ratio: float, dataset_name: str):
+    """Initialize CSV file for timing records."""
+    global TIMING_CSV_FILE, INVOCATION_COUNTER
+    
+    INVOCATION_COUNTER = 0
+    TIMING_CSV_FILE = f"./{dataset_name}_{keep_ratio}_timing.csv"
+    
+    # Create CSV with headers
+    with open(TIMING_CSV_FILE, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(['invocation_id', 'keep_ratio', 'preprocess_time', 'encode_time', 'prune_time', 'total_time'])
+    
+    print(f"Timing CSV initialized: {TIMING_CSV_FILE}")
+
+
+def record_timing(keep_ratio: float, preprocess_time: float, encode_time: float, prune_time: float):
+    """Record timing information to CSV file."""
+    global TIMING_CSV_FILE, INVOCATION_COUNTER
+    
+    if TIMING_CSV_FILE is None:
+        return
+    
+    INVOCATION_COUNTER += 1
+    total_time = preprocess_time + encode_time + prune_time
+    
+    with open(TIMING_CSV_FILE, 'a', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            INVOCATION_COUNTER,
+            keep_ratio,
+            f"{preprocess_time:.6f}",
+            f"{encode_time:.6f}",
+            f"{prune_time:.6f}",
+            f"{total_time:.6f}"
+        ])
 
 def execute_batch_pope_with_pruned_embeddings(
     modelname: str,
@@ -96,16 +133,17 @@ def execute_batch_pope_with_pruned_embeddings(
                         image_binary = extract_image_binary_from_pope_data(image_data)
                         
                         if keep_ratio == 1:
-                            reduced_tokens = getOriginalVisualToken(
+                            reduced_tokens, preprocess_time, encode_time  = getOriginalVisualToken(
                                 model,
                                 vision_tower,
                                 image_binary
                             )
+                            # Record timing with zeros for no pruning
+                            record_timing(keep_ratio, preprocess_time, encode_time, 0.0)
            
                         else:
                             # Time the pruning operation
-                            pruning_start = time.time()
-                            reduced_tokens = trimTokenatorPruning(
+                            reduced_tokens, preprocess_time, encode_time, prune_time = trimTokenatorPruning(
                                 model,
                                 vision_tower,
                                 tokenizer,
@@ -113,9 +151,7 @@ def execute_batch_pope_with_pruned_embeddings(
                                 user_prompt,
                                 keep_ratio=keep_ratio
                             )
-                            pruning_end = time.time()
-                            batch_pruning_time += (pruning_end - pruning_start)
-                            
+                            record_timing(keep_ratio, preprocess_time, encode_time, prune_time)    
                         pruned_embeddings_for_this_prompt.append(reduced_tokens.to(torch.float16))
             
             user_prompts.append(user_prompt.strip())  # Remove trailing newline
@@ -130,13 +166,8 @@ def execute_batch_pope_with_pruned_embeddings(
         outputs = []
         if base_url:            
             async def fetch_all():
-                """
-                Concurrently runs all post_http_request_with_embeds calls.
-                """
                 tasks = []
                 for i, prompt in enumerate(prompts):
-                    # Use asyncio.to_thread to run the synchronous 
-                    # post_http_request_with_embeds in a separate thread.
                     task = asyncio.to_thread(
                         post_http_request_with_embeds,
                         modelname,
@@ -253,7 +284,7 @@ def run_experiment(keep_ratio: float, dataset_name: str = "POPE_random") -> Tupl
     """Run experiment with specific keep_ratio and save results.
     Returns: (output_path, execution_time, pruning_time)
     """
-    global TOTAL_PRUNING_TIME
+    initialize_timing_csv(keep_ratio, dataset_name)
     
     print(f"\n{'='*80}")
     print(f"Running experiment with keep_ratio={keep_ratio}")
@@ -302,6 +333,9 @@ def run_experiment(keep_ratio: float, dataset_name: str = "POPE_random") -> Tupl
     end_time = time.time()
     execution_time = end_time - start_time
     pruning_time = 0
+    if TIMING_CSV_FILE and os.path.exists(TIMING_CSV_FILE):
+        timing_df = pd.read_csv(TIMING_CSV_FILE)
+        pruning_time = timing_df['total_time'].sum()
     
     print(f"\nExecution time for keep_ratio={keep_ratio}: {execution_time:.2f} seconds")
     print(f"Pruning time for keep_ratio={keep_ratio}: {pruning_time:.2f} seconds")
@@ -364,7 +398,7 @@ def calculate_accuracy(csv_path: str, keep_ratio: float) -> float:
 # Main execution
 if __name__ == "__main__":
     keep_ratios = [1, 0.056, 0.111, 0.222]
-    dataset_name = "POPE_cdprune"
+    dataset_name = "POPE_trim"
     
     overall_start = time.time()
     results = {}
