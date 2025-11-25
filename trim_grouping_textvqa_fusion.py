@@ -164,15 +164,14 @@ def preprocess_and_cache_pruned_embeddings(
     
                 else:
                     # Prune with combined guidance
-                    reduced_tokens, preprocess_time, encode_time, prune_time = enhanced_trimTokenator_multi_question(
+                    reduced_tokens, preprocess_time, encode_time, prune_time = trimTokenatorPruning_v2(
                                 model,
                                 vision_tower,
                                 tokenizer,
                                 image_binary,
                                 all_questions,
                                 keep_ratio=keep_ratio,
-                                # "attention_weighted", "max_pooling", "adaptive"
-                                fusion_method="adaptive"
+                                stage2_method="dpp"
                     )
                     record_timing(keep_ratio, preprocess_time, encode_time, prune_time) 
                 
@@ -355,7 +354,7 @@ def create_llm_udf_with_cached_embeddings(embedding_cache: Dict[str, Dict], imag
         fields_list = merged_df.to_dict('records')
 
         outputs = inference_with_cached_embeddings(
-            modelname="/data/models/llava-1.5-7b-hf",
+            modelname="llava-hf/llava-1.5-7b-hf",
             fields=fields_list,
             query=prompt_template,
             typed_fields=typed_fields,
@@ -506,13 +505,13 @@ def calculate_accuracy(csv_path: str, keep_ratio: float) -> float:
 
 # Main execution
 if __name__ == "__main__":
-    keep_ratios = [0.222, 0.111, 0.056]
+    keep_ratios = [1, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1]
     dataset_name = "textvqa_trim_grouping"
     
     overall_start = time.time()
     
     # Read POPE parquet once
-    POPE_PATH = "/home/haikai/LLM-Multimodal/VQAtext/validation-00000-of-00003.parquet"
+    POPE_PATH = "/scratch/hpc-prf-haqc/haikai/dataset/VQAText/validation-00000-of-00003.parquet"
     pope_df = spark.read.parquet(POPE_PATH)
     pope_df.createOrReplaceTempView("pope")
     

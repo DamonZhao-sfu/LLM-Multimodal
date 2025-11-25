@@ -34,6 +34,7 @@ def getCDPrunedVisualToken(model, vision_tower, image_binary, texts, keep_ratio=
 
     image_embeds = vision_tower.vision_tower.vision_model.post_layernorm(image_outputs)
     image_embeds = vision_tower.vision_tower.visual_projection(image_embeds.float())
+    
     B, N, C = image_features.shape
     image_features = image_features.to(device=model_device, dtype=torch.float16)
     image_embeds = image_embeds.to(device=model_device)

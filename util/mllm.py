@@ -3,8 +3,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 from PIL import Image
 from util.cdencoder import CLIPVisionTower
-from transformers import AutoProcessor
-from transformers import LlavaForConditionalGeneration, LlavaProcessor, CLIPVisionModel, CLIPImageProcessor
+from transformers import LlavaNextProcessor
+#from util.pruMerge import LlavaNextForConditionalGeneration
+from transformers import LlavaOnevisionForConditionalGeneration
+from transformers import LlavaNextForConditionalGeneration
+from transformers import AutoProcessor, LlavaForConditionalGeneration
 import time
 import torch
 from PIL import Image
@@ -18,7 +21,98 @@ from typing import List, Dict, Tuple, Optional, Any
 from util.prompt import DEFAULT_SYSTEM_PROMPT
 from util.utils import _generate_prompt
 import gc
+import numpy as np
 
+def load_vision_models_llava_onevision(device='cuda'):
+    """Load vision tower and projection model"""
+    print(f"[Model Loading] Loading vision tower on {device}...")
+    
+    # Set CUDA device
+    #torch.cuda.set_device(0)
+    vision_tower_name = "/scratch/hpc-prf-haqc/haikai/hf-cache/models--openai--clip-vit-large-patch14-336/snapshots/ce19dc912ca5cd21c8a653c79e251e808ccabcd1"  # Default CLIP model
+    MODEL_PATH = "llava-hf/llava-onevision-qwen2-7b-ov-hf"
+
+    class MockArgs:
+        def __init__(self):
+            self.mm_vision_select_layer = -2
+            self.mm_vision_select_feature = 'patch'
+    
+    mock_args = MockArgs()
+    vision_tower = CLIPVisionTower(vision_tower_name, mock_args, delay_load=False)
+    vision_tower = vision_tower.to('cuda')
+    vision_tower.vision_tower.config._attn_implementation = "eager"
+    vision_tower.vision_tower.config.output_attentions = True
+    model = LlavaOnevisionForConditionalGeneration.from_pretrained(
+        MODEL_PATH, 
+        torch_dtype=torch.float16, 
+        device_map='cuda',
+        attn_implementation="eager"
+    )
+
+    processor = AutoProcessor.from_pretrained(MODEL_PATH)
+
+    tokenizer = processor.tokenizer
+    
+    print(f"[Model Loading] Vision tower loaded successfully on {device}")
+    
+    return vision_tower, model, processor
+
+
+
+def load_vision_models_llava_next(device='cuda'):
+    """Load vision tower and projection model"""
+    print(f"[Model Loading] Loading vision tower on {device}...")
+    
+    # Set CUDA device
+    #torch.cuda.set_device(0)
+    vision_tower_name = "/scratch/hpc-prf-haqc/haikai/hf-cache/models--openai--clip-vit-large-patch14-336/snapshots/ce19dc912ca5cd21c8a653c79e251e808ccabcd1"  # Default CLIP model
+    MODEL_PATH = "llava-hf/llava-v1.6-mistral-7b-hf"
+
+    class MockArgs:
+        def __init__(self):
+            self.mm_vision_select_layer = -2
+            self.mm_vision_select_feature = 'patch'
+    
+    mock_args = MockArgs()
+    vision_tower = CLIPVisionTower(vision_tower_name, mock_args, delay_load=False)
+    vision_tower = vision_tower.to('cuda')
+    vision_tower.vision_tower.config._attn_implementation = "eager"
+    vision_tower.vision_tower.config.output_attentions = True
+    model = LlavaNextForConditionalGeneration.from_pretrained(
+        MODEL_PATH, 
+        torch_dtype=torch.float16, 
+        device_map='cuda',
+        attn_implementation="eager"
+    )
+
+    processor = LlavaNextProcessor.from_pretrained(MODEL_PATH)
+
+    tokenizer = processor.tokenizer
+    
+    print(f"[Model Loading] Vision tower loaded successfully on {device}")
+    
+    return vision_tower, model, processor
+
+def get_model_class(model_name):
+    if "Qwen2.5-VL" in model_name:
+        from transformers import Qwen2_5_VLForConditionalGeneration
+
+        return Qwen2_5_VLForConditionalGeneration
+    elif "Qwen2-VL" in model_name:
+        from transformers import Qwen2VLForConditionalGeneration
+
+        return Qwen2VLForConditionalGeneration
+    elif "llava-1.5" in model_name:
+        from transformers import LlavaForConditionalGeneration
+
+        return LlavaForConditionalGeneration
+    elif "llava-v1.6" in model_name:
+        from transformers import LlavaNextForConditionalGeneration
+
+        return LlavaNextForConditionalGeneration
+    else:
+        error_msg = f"Unsupported model class for: {model_name}"
+        raise ValueError(error_msg)
 
 def load_vision_models(device='cuda'):
     """Load vision tower and projection model"""
@@ -26,12 +120,9 @@ def load_vision_models(device='cuda'):
     
     # Set CUDA device
     #torch.cuda.set_device(0)
-    vision_tower_name = "/data/models/clip-vit-p14-336/snapshots/ce19dc912ca5cd21c8a653c79e251e808ccabcd1"  # Default CLIP model
-    MODEL_PATH = "/data/models/llava-1.5-7b-hf"
+    vision_tower_name = "/scratch/hpc-prf-haqc/haikai/hf-cache/models--openai--clip-vit-large-patch14-336/snapshots/ce19dc912ca5cd21c8a653c79e251e808ccabcd1"  # Default CLIP model
+    MODEL_PATH = "llava-hf/llava-1.5-7b-hf"
 
-    # Load vision tower
-    #vision_tower_name = "/scratch/hpc-prf-haqc/haikai/hf-cache/models--openai--clip-vit-large-patch14-336/snapshots/ce19dc912ca5cd21c8a653c79e251e808ccabcd1"
-    
     class MockArgs:
         def __init__(self):
             self.mm_vision_select_layer = -2
@@ -51,11 +142,7 @@ def load_vision_models(device='cuda'):
     )
 
     processor = AutoProcessor.from_pretrained(MODEL_PATH)
-
-    tokenizer = processor.tokenizer
-    
-    print(f"[Model Loading] Vision tower loaded successfully on {device}")
-    
+    tokenizer = processor.tokenizer    
     return vision_tower, model, tokenizer
 
 
@@ -168,6 +255,133 @@ def call_vllm_api_with_embeds(image_embedding, question="What's in this image?",
         print(f"Error calling vLLM API: {e}")
         return None
 
+def getOriginalVisualToken_Next(model, processor, image_binary):
+    preprocess_start = time.time()
+    image = Image.open(io.BytesIO(image_binary))
+    
+    # 1. Use the specific LlavaNextProcessor (handles AnyRes grid splitting)
+    inputs = processor(text="", images=image, return_tensors="pt")
+    
+    # Inputs now contains 'pixel_values' AND 'image_sizes'
+    pixel_values = inputs["pixel_values"].to(model.device, dtype=model.dtype)
+    image_sizes = inputs["image_sizes"].to(model.device)
+    
+    preprocess_end = time.time()
+    preprocess_time = preprocess_end - preprocess_start
+    
+    encode_begin = time.time()
+    
+    # 2. Pass through the Vision Tower
+    # We can rely on the model's internal helper to handle the grid/newline logic
+    # model.vision_tower is usually the CLIP tower, but we need the model's method
+    # to handle the multi-patch logic.
+    if pixel_values.ndim == 5:
+        batch_size, num_patches, c, h, w = pixel_values.shape
+        pixel_values = pixel_values.view(batch_size * num_patches, c, h, w)
+    
+    with torch.no_grad():
+        # Get the vision features from the backbone
+        image_outputs = model.vision_tower(pixel_values, output_hidden_states=True)
+        selected_image_features = image_outputs.hidden_states[model.config.vision_feature_layer]
+        
+        # 3. Project features
+        image_features = model.multi_modal_projector(selected_image_features)
+        
+        # 4. CRITICAL: Apply the AnyRes packing logic (Newline insertion)
+        # This function reshapes the grid and adds the newline tokens
+        # Note: Different HF versions might name this slightly differently.
+        # This is based on standard LlavaNext implementation.
+        image_features = model.pack_image_features(
+            image_features,
+            image_sizes,
+            vision_feature_select_strategy=model.config.vision_feature_select_strategy
+        )
+
+    encode_end = time.time()
+    encode_time = encode_end - encode_begin
+
+    # Squeeze is usually not needed here as image_features is (N_tokens, Dim) 
+    # but if batch size is 1, ensure it fits your API expectation.
+    return image_features, preprocess_time, encode_time
+
+def getOriginalVisualTokenLlavaNext(model, processor, image_binary, **kwargs):
+
+    image = Image.open(io.BytesIO(image_binary))
+    inputs = processor(text="", images=image, return_tensors="pt").to(model.device)
+    
+    pixel_values = inputs.pixel_values
+    image_num_patches = None
+    #if "LlavaNextForConditionalGeneration" in model.config.architectures and pixel_values.dim() == 5:
+    from transformers.models.llava_next.modeling_llava_next import image_size_to_num_patches
+    print("LlavaNextForConditionalGeneration")
+    image_num_patches = [
+        image_size_to_num_patches(
+            image_size=imsize,
+            grid_pinpoints=model.config.image_grid_pinpoints,
+            patch_size=model.config.vision_config.image_size,
+        )
+        for imsize in inputs.image_sizes
+    ]
+    # stacked if input is (batch_size, num_patches, num_channels, height, width)
+    _pixel_values_list = [pix_val[:num_patch] for pix_val, num_patch in zip(pixel_values, image_num_patches)]
+    pixel_values = torch.cat(_pixel_values_list, dim=0)
+
+    if hasattr(model, "vision_tower"):  # llava or internvl
+        vision_feature_layer = kwargs.get("vision_feature_layer", -1)
+        image_features = model.vision_tower(pixel_values=pixel_values.to(device='cuda'), output_hidden_states=True)  # .last_hidden_state
+        image_features = image_features.hidden_states[vision_feature_layer]
+
+        if kwargs.get("vision_feature_select_strategy") == "default":
+            image_features = image_features[:, 1:]  # remove CLS token
+        if image_num_patches is None:  # LlavaForConditionalGeneration
+            image_num_patches = image_features.shape[0]
+    elif hasattr(model, "visual") or hasattr(model, "vision_tower"):  # qwen
+        image_features = model.visual.patch_embed(pixel_values)
+        image_num_patches = (kwargs["image_grid_thw"].prod(-1)).tolist()
+    else:
+        error_msg = "Unsupported visual model"
+        raise NotImplementedError(error_msg)
+
+    image_features = torch.split(image_features, image_num_patches, dim=0)
+
+    #if "LlavaNextForConditionalGeneration" in model.config.architectures:
+    print("LlavaNextForConditionalGeneration")
+    embed_std = 1 / np.sqrt(model.config.text_config.hidden_size)
+    image_newline = torch.Tensor(
+        torch.randn(image_features[0].shape[-1], dtype=image_features[0].dtype) * embed_std
+    ).to(model.device)
+    image_features, _ = model.pack_image_features(
+        image_features,
+        inputs.image_sizes,
+        vision_feature_select_strategy=kwargs.get("vision_feature_select_strategy"),
+        image_newline=image_newline,
+    )
+    # elif (
+    #     "Qwen2_5_VLForConditionalGeneration" in model.config.architectures
+    #     or "Qwen2VLForConditionalGeneration" in model.config.architectures
+    # ):
+    #     spatial_merge_size = model.visual.config.spatial_merge_size
+    #     pooled_image_features = []
+    #     for img_feat, (t, h, w) in zip(image_features, kwargs["image_grid_thw"]):
+    #         num_patches, d = img_feat.shape
+    #         assert t == 1, "Only single-frame temporal dimension supported"
+    #         assert h * w == num_patches, f"H*W != num_patches: {h}*{w} != {num_patches}"
+
+    #         # Reshape to [1, D, H, W]
+    #         x = img_feat.view(h, w, d).permute(2, 0, 1).unsqueeze(0)
+
+    #         # Apply avg pooling
+    #         x_pooled = F.avg_pool2d(x, kernel_size=spatial_merge_size, stride=spatial_merge_size)
+
+    #         # Reshape back to [num_pooled_patches, D]
+    #         pooled = x_pooled.squeeze(0).permute(1, 2, 0).reshape(-1, d)
+    #         pooled_image_features.append(pooled)
+    #     image_features = pooled_image_features
+
+    if image_features[0].dim() < 3:
+        image_features = [feat_i.unsqueeze(0) for feat_i in image_features]
+    return image_features.detach().cpu()
+
 
 def getOriginalVisualToken(model, vision_tower, image_binary):
     
@@ -194,7 +408,7 @@ def getOriginalVisualToken(model, vision_tower, image_binary):
     encode_end = time.time()
     encode_time = encode_end - encode_begin
 
-    return image_features,preprocess_time,encode_time
+    return image_features.squeeze(0),preprocess_time,encode_time
 
 
 def process_text_efficiently(texts, vision_tower, model_device):
@@ -476,7 +690,6 @@ def post_http_request_with_embeds(
     answer_schema: Optional[Dict[str, Any]] = None,  # Optional JSON schema parameter
 ) -> requests.Response:
     messages_list = []
-    
     for i, prompt in enumerate(prompts):
         content = []
         
@@ -485,7 +698,7 @@ def post_http_request_with_embeds(
             "text": prompt
         })
         
-        if image_embeddings and i < len(image_embeddings) and image_embeddings[i] is not None:
+        if image_embeddings:
             embedding_data = image_embeddings[i]
             embedding = encode_image_embedding_to_base64(embedding_data)
             content.append({
@@ -519,68 +732,6 @@ def post_http_request_with_embeds(
         response = session.send(prepared)
 
     return response
-
-
-# def post_http_request_with_embeds(
-#     model: str,
-#     prompts: List[str],
-#     temperature: float = 1.0,
-#     api_url: str = "http://localhost:8000/v1/chat/completions",
-#     guided_choice: List[str] = None,
-#     image_embeddings: List[torch.Tensor] = None,  # Changed: List of embedding tensors
-# ) -> requests.Response:
-#     messages_list = []
-    
-#     for i, prompt in enumerate(prompts):
-#         content = []
-        
-#         content.append({
-#             "type": "text",
-#             "text": prompt
-#         })
-        
-#         if image_embeddings and i < len(image_embeddings) and image_embeddings[i] is not None:
-#             embedding_data = image_embeddings[i]
-#             embedding = encode_image_embedding_to_base64(embedding_data)
-#             content.append({
-#                 "type": "image_embeds",
-#                 "image_embeds": embedding
-#             })
-        
-#         messages_list.append({
-#             "role": "user",
-#             "content": content
-#         })
-    
-#     answer_schema = {
-#         "type": "object",
-#         "properties": {
-#             "Answer": {
-#                 "type": "string"
-#             }
-#         },
-#         "required": ["Answer"]
-#     }
-
-#     pload = {
-#         "model": model,
-#         "messages": messages_list,
-#         "temperature": temperature,
-#         "guided_json": answer_schema,  # vLLM's guided_json parameter
-
-#     }
-#     if guided_choice is not None and len(guided_choice) > 0:
-#         pload["guided_choice"] = guided_choice
-
-
-#     headers = {"Content-Type": "application/json"}
-#     req = requests.Request('POST', api_url, headers=headers, data=json.dumps(pload))
-#     prepared = req.prepare()
-
-#     with requests.Session() as session:
-#         response = session.send(prepared)
-
-#     return response
 
 def execute_batch_v2_with_pruned_embeddings(
     modelname,

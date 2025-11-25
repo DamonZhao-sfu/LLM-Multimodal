@@ -328,7 +328,7 @@ def create_llm_udf_with_cached_embeddings(embedding_cache: Dict[str, Dict], imag
         fields_list = merged_df.to_dict('records')
 
         outputs = inference_with_cached_embeddings(
-            modelname="/data/models/llava-1.5-7b-hf",
+            modelname="llava-hf/llava-1.5-7b-hf",
             fields=fields_list,
             query=prompt_template,
             typed_fields=typed_fields,
@@ -466,13 +466,13 @@ def calculate_accuracy(csv_path: str, keep_ratio: float) -> float:
 
 # Main execution
 if __name__ == "__main__":
-    keep_ratios = [0.222, 0.111, 0.056,1]
+    keep_ratios = [1,0.9,0.8,0.7,0.6,0.5,0.4,0.3,0.2,0.1]
     dataset_name = "POPE_trim_grouping"
     
     overall_start = time.time()
     
     # Read POPE parquet once
-    POPE_PATH = "/home/haikai/haikai/entropyTest/POPE.parquet"
+    POPE_PATH = "/scratch/hpc-prf-haqc/haikai/dataset/POPE/random-00000-of-00001.parquet"
     pope_df = spark.read.parquet(POPE_PATH)
     pope_df.createOrReplaceTempView("pope")
     
@@ -481,7 +481,7 @@ if __name__ == "__main__":
     
     results = {}
     execution_times = {}
-    preprocessing_times = {} # ADDED: Dictionary to store preprocessing times
+    pruning_times = {}
     
     # Run experiments for each keep_ratio
     for keep_ratio in keep_ratios:
@@ -528,7 +528,7 @@ if __name__ == "__main__":
         for keep_ratio in keep_ratios:
             accuracy = results.get(keep_ratio)
             exec_time = execution_times.get(keep_ratio, 0)
-            prep_time = preprocessing_times.get(keep_ratio, 0) # ADDED
+            prep_time = pruning_times.get(keep_ratio, 0) # ADDED
             if accuracy is not None:
                 # CHANGED: Added prep_time to the output
                 f.write(f"{keep_ratio:<15.3f} {accuracy:<15.2f}% {exec_time:<20.2f} {prep_time:<20.2f} {'✓':<15}\n")
@@ -551,7 +551,7 @@ if __name__ == "__main__":
     for keep_ratio in keep_ratios:
         accuracy = results.get(keep_ratio)
         exec_time = execution_times.get(keep_ratio, 0)
-        prep_time = preprocessing_times.get(keep_ratio, 0) # ADDED
+        prep_time = pruning_times.get(keep_ratio, 0) # ADDED
         if accuracy is not None:
             # CHANGED: Added prep_time to the console output
             print(f"{keep_ratio:<15.3f} {accuracy:<15.2f}% {exec_time:<20.2f} {prep_time:<20.2f} {'✓':<15}")

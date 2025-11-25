@@ -2,14 +2,13 @@ import sys
 import os
 import time
 import pandas as pd
-from typing import Tuple, List, Dict, Any, Callable
-from pyspark.sql.functions import array_contains, lower, trim, col, when, expr, regexp_replace, get_json_object
-
+from typing import Tuple, List, Dict, Any
 import json
 import asyncio
-
+import csv
 from util.utils import _generate_prompt
-
+from vllm import LLM as VllmEngine # <--- Rename here to avoid collisions
+from vllm import SamplingParams
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import pandas_udf, col, when, lower, trim
 from pyspark.sql.types import StringType
@@ -18,7 +17,8 @@ from util.utils import *
 from util.cdencoder import *
 from util.cdpruner import *
 from util.trimTokenator import *
-
+from util.pruMerge import *
+from util.visual_util import *
 # Get the absolute path of the project root
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "./"))
 sys.path.insert(0, project_root)
@@ -47,6 +47,44 @@ RECOVERY_RATIO = 0.0
 
 # Global variable to track pruning time
 TOTAL_PRUNING_TIME = 0.0
+TIMING_CSV_FILE = None
+INVOCATION_COUNTER = 0
+
+def initialize_timing_csv(keep_ratio: float, dataset_name: str):
+    """Initialize CSV file for timing records."""
+    global TIMING_CSV_FILE, INVOCATION_COUNTER
+    
+    INVOCATION_COUNTER = 0
+    TIMING_CSV_FILE = f"./{dataset_name}_{keep_ratio}_timing.csv"
+    
+    # Create CSV with headers
+    with open(TIMING_CSV_FILE, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(['invocation_id', 'keep_ratio', 'preprocess_time', 'encode_time', 'prune_time', 'total_time'])
+    
+    print(f"Timing CSV initialized: {TIMING_CSV_FILE}")
+
+
+def record_timing(keep_ratio: float, preprocess_time: float, encode_time: float, prune_time: float):
+    """Record timing information to CSV file."""
+    global TIMING_CSV_FILE, INVOCATION_COUNTER
+    
+    if TIMING_CSV_FILE is None:
+        return
+    
+    INVOCATION_COUNTER += 1
+    total_time = preprocess_time + encode_time + prune_time
+    
+    with open(TIMING_CSV_FILE, 'a', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            INVOCATION_COUNTER,
+            keep_ratio,
+            f"{preprocess_time:.6f}",
+            f"{encode_time:.6f}",
+            f"{prune_time:.6f}",
+            f"{total_time:.6f}"
+        ])
 
 
 def execute_batch_pope_with_pruned_embeddings(
@@ -58,135 +96,128 @@ def execute_batch_pope_with_pruned_embeddings(
     reordered_columns: List[str],
     system_prompt: str = DEFAULT_SYSTEM_PROMPT,
     guided_choice: List[str] = None,
-    base_url: str = "http://localhost:8000/v1",
+    base_url: str = None, # Not used in offline mode, but kept for signature compatibility
 ) -> Tuple[List[str], float]:
-    """Returns: (outputs, accumulated_pruning_time)"""
-    vision_tower, model, tokenizer = load_vision_models(device='cuda')
-    batch_pruning_time = 0.0  # Track pruning time for this batch
     
-    try:
-        # Build user prompts and generate pruned embeddings
-        user_prompts = []
-        all_pruned_embeddings = []
-        
+    # --- PHASE 1: Pruning / Embedding Generation (PyTorch) ---
+    print("Phase 1: Loading Vision Model for Pruning...")
+    vision_tower, model, processor = load_vision_models_llava_next(device='cuda')
+    
+    user_prompts = []
+    all_pruned_embeddings = []
+    batch_pruning_time = 0.0
+    
+        # --- PHASE 2: Inference (vLLM) ---
+    print("Phase 2: Loading vLLM Engine...")
+    
+    
+    scratch_path = "/scratch/hpc-prf-haqc"
+    user_path = f"{scratch_path}/haikai"
 
+    # Set the variables
+    os.environ["HF_HOME"] = f"{user_path}/hf-cache"
+    os.environ["VLLM_CACHE_DIR"] = f"{user_path}/vllm-cache"
+    os.environ["TORCH_COMPILE_CACHE"] = f"{user_path}/vllm-cache/torch_compile_cache"
+    os.environ["TRANSFORMERS_CACHE"] = f"{user_path}/hf-cache"
+
+    # Triton/Inductor caches (Critical for vllm performance/compilation)
+    os.environ["TRITON_CACHE_DIR"] = f"{scratch_path}/vllm-compile-cache"
+    os.environ["TORCHINDUCTOR_CACHE_DIR"] = f"{scratch_path}/vllm-compile-cache"
+
+    # -----------------------------------------------------------------------
+    # 2. NOW IMPORT AND INITIALIZE VLLM
+    # -----------------------------------------------------------------------
+    # It is safe to import vllm now that the paths are set
+    from vllm import LLM as VllmEngine 
+    from vllm import SamplingParams
+
+    # Initialize
+    llm = VllmEngine(
+        model=modelname,
+        limit_mm_per_prompt={"image": 1},
+        trust_remote_code=True,
+        gpu_memory_utilization=0.5, 
+        enforce_eager=True,
+        enable_mm_embeds=True,
+        download_dir=os.environ["HF_HOME"] # Explicitly enforce it here too just in case
+    )
+    final_results = []
+    try:
         for field_dict in fields:
-            # Initialize prompt with empty string - we'll build it from scratch
             user_prompt = ""
             pruned_embeddings_for_this_prompt = []
             
-            # Build prompt following the REORDERED column sequence
             for field_name in reordered_columns:
-                # Find the field type for this field name
-                field_type = None
-                for fname, ftype in typed_fields:
-                    if fname == field_name:
-                        field_type = ftype
-                        break
+                # ... (Existing logic to find field type) ...
+                field_type = next((ft for fn, ft in typed_fields if fn == field_name), None)
                 
-                if field_type is None:
-                    continue  # Skip if field not found in typed_fields
                 if field_type == "text":
                     value = field_dict.get(field_name, "")
                     user_prompt += f"{field_name}: {value}\n"
                 
                 elif field_type == "image":
-                    user_prompt += f"{field_name}: [image]\n"
-                    image_data = field_dict.get(field_name)
+                    # IMPORTANT: vLLM needs the <image> token to know where to inject embeddings
+                    user_prompt += f"{field_name}: <image>\n" 
                     
+                    image_data = field_dict.get(field_name)
                     if image_data is not None:
                         image_binary = extract_image_binary_from_pope_data(image_data)
+                        messages = [
+                            {
+                                "role": "user",
+                                "content": [{"type": "text", "text": ""}, {"type": "image", "image": Image.open(io.BytesIO(image_binary))}],
+                            }
+                        ]
+                        #prompt = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+                        # Process Image
+                        #inputs = processor(text="<image>", images=Image.open(io.BytesIO(image_binary)), return_tensors="pt")
                         
-                        if keep_ratio == 1:
-                            reduced_tokens, _, _ = getOriginalVisualToken(
-                                model,
-                                vision_tower,
-                                image_binary
-                            )
-           
-                        else:
-                            # Time the pruning operation
-                            pruning_start = time.time()
-                            reduced_tokens, _, _, _ = trimTokenatorPruning(
-                                model,
-                                vision_tower,
-                                tokenizer,
-                                image_binary,
-                                user_prompt,
-                                keep_ratio=keep_ratio
-                            )
-                            pruning_end = time.time()
-                            batch_pruning_time += (pruning_end - pruning_start)
-                            
-                        pruned_embeddings_for_this_prompt.append(reduced_tokens.to(torch.float16))
-            
-            user_prompts.append(user_prompt.strip())  # Remove trailing newline
-            all_pruned_embeddings.append(
-                pruned_embeddings_for_this_prompt[0] if pruned_embeddings_for_this_prompt else None
-            )
-        
-        # Generate full prompts
-        prompts = [_generate_prompt(user_prompt=user_prompt, system_prompt=system_prompt) 
-                   for user_prompt in user_prompts]
-        
-        answer_schema = {
-            "type": "object",
-            "properties": {"Answer": {"type": "string"}},
-            "required": ["Answer"]
-        }
+                        #reduced_tokens = get_inputs_embeds(model, inputs)
+                        
+                        full_prompt = _generate_prompt(user_prompt=user_prompt, system_prompt=system_prompt)
 
-        outputs = []
-        if base_url:            
-            async def fetch_all():
-                """
-                Concurrently runs all post_http_request_with_embeds calls.
-                """
-                tasks = []
-                for i, prompt in enumerate(prompts):
-                    task = asyncio.to_thread(
-                        post_http_request_with_embeds,
-                        modelname,
-                        [prompt],
-                        temperature=0,
-                        api_url=(base_url + "/chat/completions"),
-                        guided_choice=guided_choice,
-                        answer_schema=answer_schema,
-                        image_embeddings=[all_pruned_embeddings[i]] if all_pruned_embeddings[i] is not None else None
-                    )
-                    tasks.append(task)
-                
-                # Gather all responses concurrently
-                responses = await asyncio.gather(*tasks)
-                
-                # Process responses in order
-                processed_outputs = []
-                for response in responses:
-                    try:
-                        # Assuming response has a .content attribute like a requests.Response
-                        request_output = json.loads(response.content) 
-                        choices = request_output.get('choices', [])
+                        #embed_tensor = reduced_tokens[0].detach().cpu()  # Changed this line
                         
-                        if choices and 'message' in choices[0] and 'content' in choices[0]['message']:
-                            processed_outputs.append(choices[0]['message']['content'])
-                        else:
-                            # Log error or empty response
-                            print(f"Warning: No valid content in response. Output: {request_output}")
-                            processed_outputs.append(None)
-                    except Exception as e:
-                        # Log exception
-                        print(f"Error processing response: {e}. Response content: {getattr(response, 'content', 'N/A')}")
-                        processed_outputs.append(None)
-                        
-                return processed_outputs
+                        #print(f"Embed tensor shape: {embed_tensor.shape}")  # Should be [num_tokens, hidden_dim]
+                        #print(f"Embed tensor dim: {embed_tensor.dim()}")    # Should be 2
+                        #case 1: 3D tensor
+                        #image_embeds = torch.randn(1, 16, 1024)
 
-            # Run the async main function from our synchronous context
-            # This will block until all concurrent requests are complete
-            outputs = asyncio.run(fetch_all())            
-            return outputs, batch_pruning_time
-    
+                        #case 2: 2D tensor
+                        #image_embeds = torch.randn(16, 1024)
+
+                        #case 3: list of 2D tensor
+                        image_embeds = [torch.randn(16, 1024)]
+
+                        #case 4: list of 3D tensor
+                        #image_embeds = [torch.randn(1, 16, 1024)]
+
+                        input_item = {
+                            "prompt": "",
+                            "multi_modal_data": {
+                                "image": image_embeds
+                            }
+                        }
+                        outputs = llm.generate(input_item)
+                        for o in outputs:
+                            final_results.append(o.outputs[0].text)
+
+            user_prompts.append(user_prompt.strip())
+            # Store only the first image embedding found (assuming 1 image per prompt based on your logic)
+            # all_pruned_embeddings.append(
+            #     pruned_embeddings_for_this_prompt if pruned_embeddings_for_this_prompt else None
+            # )
+
     finally:
+        # --- MEMORY MANAGEMENT ---
+        # We MUST destroy the PyTorch model to free up VRAM for vLLM
+        print("Phase 1 Complete. Unloading PyTorch model to free VRAM...")
+        del vision_tower
+        del model
+        del processor
         torch.cuda.empty_cache()
 
+    return final_results, batch_pruning_time
 
 def create_llm_udf_with_embeddings(
     keep_ratio: float
@@ -229,13 +260,15 @@ def create_llm_udf_with_embeddings(
         fields_list = merged_df.to_dict('records')
         
         outputs, batch_pruning_time = execute_batch_pope_with_pruned_embeddings(
-            modelname="llava-hf/llava-1.5-7b-hf",
+            modelname="llava-hf/llava-onevision-qwen2-7b-ov-hf",
             fields=fields_list,
             query=prompt_template,
             keep_ratio=keep_ratio,
             typed_fields=typed_fields,
             reordered_columns=reordered_columns,
             system_prompt=DEFAULT_SYSTEM_PROMPT,
+            guided_choice=["Yes", "No"],
+            trust_remote_code=True,
             base_url="http://localhost:8000/v1"
         )
         
@@ -259,7 +292,7 @@ def run_experiment(keep_ratio: float, dataset_name: str = "POPE_random") -> Tupl
     """Run experiment with specific keep_ratio and save results.
     Returns: (output_path, execution_time, pruning_time)
     """
-    global TOTAL_PRUNING_TIME
+    initialize_timing_csv(keep_ratio, dataset_name)
     
     print(f"\n{'='*80}")
     print(f"Running experiment with keep_ratio={keep_ratio}")
@@ -275,52 +308,42 @@ def run_experiment(keep_ratio: float, dataset_name: str = "POPE_random") -> Tupl
     spark.udf.register("LLM", llm_udf)
     
     # Read POPE parquet
-    POPE_PATH = "/scratch/hpc-prf-haqc/haikai/dataset/VQAText/validation-00000-of-00003.parquet"
-    pope_df = spark.read.parquet(POPE_PATH)
+    POPE_PATH = "/scratch/hpc-prf-haqc/haikai/dataset/POPE/random-00000-of-00001.parquet"
+    pope_df = spark.read.parquet(POPE_PATH).limit(50)
     pope_df.createOrReplaceTempView("pope")
+    print(f"Total records: {pope_df.count()}")
     
     # Execute query with proper column references
     result_df = spark.sql("""
         SELECT 
-            answers,
-            LLM('Given the question: {text:question} and image: {image:image}, give me the answer to the question', question, image) as predicted
+            id,
+            question_id,
+            question,
+            answer,
+            image_source,
+            LLM('Given the text: {text:question} and image: {image:image} give me the answer to the question', question, image) as predicted
         FROM pope
     """)
     
-    # Clean the predicted column to remove newlines and extra whitespace
-    result_df_cleaned = result_df.withColumn(
-        "predicted",
-        regexp_replace(col("predicted"), r"[\n\r]+", " ")  # Replace newlines with space
-    ).withColumn(
-        "predicted",
-        regexp_replace(col("predicted"), r"\s+", " ")  # Replace multiple spaces with single space
-    ).withColumn(
-        "predicted",
-        trim(col("predicted"))  # Trim leading/trailing whitespace
-    )
-
-    result_df_with_comparison = result_df_cleaned.withColumn(
-        "answer_text",
-        lower(trim(get_json_object(col("predicted"), "$.Answer")))
-    ).withColumn(
+    # Normalize both answer and predicted columns for comparison
+    result_df_with_comparison = result_df.withColumn(
         "is_correct",
         when(
-            expr("exists(answers, x -> lower(trim(answer_text)) like concat('%', lower(trim(x)), '%'))"),
+            lower(trim(col("predicted"))) == lower(trim(col("answer"))),
             1
         ).otherwise(0)
-    ).drop("answer_text", "answers")
+    ).drop("question")
     
-    # Write results to CSV with proper escaping
+    # Write results to CSV
     output_path = f"./{dataset_name}_{keep_ratio}.csv"
-    result_df_with_comparison.coalesce(1).write.mode("overwrite") \
-        .option("header", "true") \
-        .option("quote", '"') \
-        .option("escape", '"') \
-        .csv(output_path)
+    result_df_with_comparison.coalesce(1).write.mode("overwrite").option("header", "true").csv(output_path)
     
     end_time = time.time()
     execution_time = end_time - start_time
     pruning_time = 0
+    if TIMING_CSV_FILE and os.path.exists(TIMING_CSV_FILE):
+        timing_df = pd.read_csv(TIMING_CSV_FILE)
+        pruning_time = timing_df['total_time'].sum()
     
     print(f"\nExecution time for keep_ratio={keep_ratio}: {execution_time:.2f} seconds")
     print(f"Pruning time for keep_ratio={keep_ratio}: {pruning_time:.2f} seconds")
@@ -382,8 +405,8 @@ def calculate_accuracy(csv_path: str, keep_ratio: float) -> float:
 
 # Main execution
 if __name__ == "__main__":
-    keep_ratios = [1, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1]
-    dataset_name = "vqatext_trim"
+    keep_ratios = [1]
+    dataset_name = "POPE_llavanext"
     
     overall_start = time.time()
     results = {}

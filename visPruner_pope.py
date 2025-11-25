@@ -258,7 +258,7 @@ def create_llm_udf_with_embeddings(
         fields_list = merged_df.to_dict('records')
         
         outputs = execute_batch_pope_with_pruned_embeddings(
-            modelname="/data/models/llava-1.5-7b-hf",
+            modelname="llava-hf/llava-1.5-7b-hf",
             fields=fields_list,
             query=prompt_template,
             keep_ratio=keep_ratio,
@@ -296,7 +296,7 @@ def run_experiment(keep_ratio: float, dataset_name: str = "POPE_random") -> Tupl
     spark.udf.register("LLM", llm_udf)
     
     # Read POPE parquet
-    POPE_PATH = "/home/haikai/haikai/entropyTest/POPE.parquet"
+    POPE_PATH = "/scratch/hpc-prf-haqc/haikai/dataset/POPE/random-00000-of-00001.parquet"
     pope_df = spark.read.parquet(POPE_PATH)
     pope_df.createOrReplaceTempView("pope")
     print(f"Total records: {pope_df.count()}")

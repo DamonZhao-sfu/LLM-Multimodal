@@ -96,7 +96,8 @@ def execute_batch_pope_with_pruned_embeddings(
     base_url: str = "http://localhost:8000/v1",
 ) -> Tuple[List[str], float]:
     """Returns: (outputs, accumulated_pruning_time)"""
-    vision_tower, model, tokenizer = load_vision_models(device='cuda')
+    #vision_tower, model, tokenizer = load_vision_models(device='cuda')
+    vision_tower, model, tokenizer = load_vision_models_llava_next(device='cuda')
     batch_pruning_time = 0.0  # Track pruning time for this batch
     
     try:
@@ -156,7 +157,7 @@ def execute_batch_pope_with_pruned_embeddings(
             
             user_prompts.append(user_prompt.strip())  # Remove trailing newline
             all_pruned_embeddings.append(
-                pruned_embeddings_for_this_prompt[0] if pruned_embeddings_for_this_prompt else None
+                pruned_embeddings_for_this_prompt if pruned_embeddings_for_this_prompt else None
             )
         
         # Generate full prompts
@@ -253,7 +254,7 @@ def create_llm_udf_with_embeddings(
         fields_list = merged_df.to_dict('records')
         
         outputs, batch_pruning_time = execute_batch_pope_with_pruned_embeddings(
-            modelname="/data/models/llava-1.5-7b-hf",
+            modelname="llava-hf/llava-1.5-7b-hf",
             fields=fields_list,
             query=prompt_template,
             keep_ratio=keep_ratio,
@@ -300,7 +301,7 @@ def run_experiment(keep_ratio: float, dataset_name: str = "POPE_random") -> Tupl
     spark.udf.register("LLM", llm_udf)
     
     # Read POPE parquet
-    POPE_PATH = "/home/haikai/haikai/entropyTest/POPE.parquet"
+    POPE_PATH = "/scratch/hpc-prf-haqc/haikai/dataset/POPE/random-00000-of-00001.parquet"
     pope_df = spark.read.parquet(POPE_PATH)
     pope_df.createOrReplaceTempView("pope")
     print(f"Total records: {pope_df.count()}")
@@ -397,7 +398,7 @@ def calculate_accuracy(csv_path: str, keep_ratio: float) -> float:
 
 # Main execution
 if __name__ == "__main__":
-    keep_ratios = [1, 0.056, 0.111, 0.222]
+    keep_ratios = [1,0.9,0.8,0.7,0.6,0.5,0.4,0.3,0.2,0.1]
     dataset_name = "POPE_trim"
     
     overall_start = time.time()

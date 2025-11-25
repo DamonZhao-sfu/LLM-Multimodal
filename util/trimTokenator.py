@@ -3,47 +3,12 @@ import time
 import torch
 import numpy as np
 from PIL import Image
-import requests
-import json
 import io
-import base64
-import os
 import torch
 import torch.nn as nn
 from datetime import datetime
 from transformers import LlavaForConditionalGeneration, LlavaProcessor, CLIPVisionModel, CLIPImageProcessor
 from util.cdencoder import CLIPVisionTower  # Assuming first file is saved as clipEncoder.py
-
-@torch.no_grad()
-def getTokenCount(model, vision_tower, tokenizer, image_binary, texts):
-    image = Image.open(io.BytesIO(image_binary))
-    inputs = vision_tower.image_processor(image, return_tensors="pt")
-    images = inputs["pixel_values"]
-    
-    model_device = vision_tower.device
-    
-    # Extract visual features
-    image_forward_outs = vision_tower.vision_tower(
-        images.to(device=model_device, dtype=vision_tower.dtype), 
-        output_hidden_states=True
-    )
-    image_outputs = vision_tower.feature_select(image_forward_outs)
-    image_features = image_outputs.to(images.dtype)
-    
-    B, N, C = image_features.shape
-
-    text_inputs = tokenizer(
-            text=texts, 
-            return_tensors="pt", 
-            padding=True
-            ).to(device=model_device)
-        
-    text_embeds = model.get_input_embeddings()(text_inputs.input_ids) # <-- FIX: 4096-dim
-    text_embeds = text_embeds.to(device=model_device, dtype=torch.float16)
-    M = text_embeds.shape[1]  # Number of text tokens
-
-    
-
 
 @torch.no_grad()
 def trimTokenatorPruning(model, vision_tower, tokenizer, image_binary, texts, keep_ratio=0.25, 
@@ -198,9 +163,8 @@ def trimTokenatorPruning(model, vision_tower, tokenizer, image_binary, texts, ke
     # Sort indices to maintain spatial order (optional, improves interpretability)
     final_original_indices_sorted, sort_order = torch.sort(final_original_indices, dim=1)
     X_v2_sorted = X_v2[batch_indices_final, sort_order]
-    print(X_v2_sorted.shape)
     # Move to CPU and detach
-    result = X_v2_sorted.detach().cpu()
+    result = X_v2_sorted.squeeze(0).detach().cpu()
     prune_end = time.time()
     prune_time = prune_end-prune_begin
     return result, preprocess_time, encode_time, prune_time

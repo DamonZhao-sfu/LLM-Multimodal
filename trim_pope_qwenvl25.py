@@ -2,12 +2,10 @@ import sys
 import os
 import time
 import pandas as pd
-from typing import Tuple, List, Dict, Any, Callable
-from pyspark.sql.functions import array_contains, lower, trim, col, when, expr, regexp_replace, get_json_object
-
+from typing import Tuple, List, Dict, Any
 import json
 import asyncio
-
+import csv
 from util.utils import _generate_prompt
 
 from pyspark.sql import SparkSession
@@ -18,7 +16,8 @@ from util.utils import *
 from util.cdencoder import *
 from util.cdpruner import *
 from util.trimTokenator import *
-
+from util.pruMerge import *
+from util.visual_util import *
 # Get the absolute path of the project root
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "./"))
 sys.path.insert(0, project_root)
@@ -47,7 +46,44 @@ RECOVERY_RATIO = 0.0
 
 # Global variable to track pruning time
 TOTAL_PRUNING_TIME = 0.0
+TIMING_CSV_FILE = None
+INVOCATION_COUNTER = 0
 
+def initialize_timing_csv(keep_ratio: float, dataset_name: str):
+    """Initialize CSV file for timing records."""
+    global TIMING_CSV_FILE, INVOCATION_COUNTER
+    
+    INVOCATION_COUNTER = 0
+    TIMING_CSV_FILE = f"./{dataset_name}_{keep_ratio}_timing.csv"
+    
+    # Create CSV with headers
+    with open(TIMING_CSV_FILE, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(['invocation_id', 'keep_ratio', 'preprocess_time', 'encode_time', 'prune_time', 'total_time'])
+    
+    print(f"Timing CSV initialized: {TIMING_CSV_FILE}")
+
+
+def record_timing(keep_ratio: float, preprocess_time: float, encode_time: float, prune_time: float):
+    """Record timing information to CSV file."""
+    global TIMING_CSV_FILE, INVOCATION_COUNTER
+    
+    if TIMING_CSV_FILE is None:
+        return
+    
+    INVOCATION_COUNTER += 1
+    total_time = preprocess_time + encode_time + prune_time
+    
+    with open(TIMING_CSV_FILE, 'a', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            INVOCATION_COUNTER,
+            keep_ratio,
+            f"{preprocess_time:.6f}",
+            f"{encode_time:.6f}",
+            f"{prune_time:.6f}",
+            f"{total_time:.6f}"
+        ])
 
 def execute_batch_pope_with_pruned_embeddings(
     modelname: str,
@@ -60,24 +96,29 @@ def execute_batch_pope_with_pruned_embeddings(
     guided_choice: List[str] = None,
     base_url: str = "http://localhost:8000/v1",
 ) -> Tuple[List[str], float]:
-    """Returns: (outputs, accumulated_pruning_time)"""
-    vision_tower, model, tokenizer = load_vision_models(device='cuda')
-    batch_pruning_time = 0.0  # Track pruning time for this batch
+    processor = AutoProcessor.from_pretrained(modelname, trust_remote_code=True)
+    model_cls = get_model_class(modelname)
+    kwargs = {"temperature": None, "top_p": None, "top_k": None}
+    kwargs["attn_implementation"] = "eager"
+
+    model = model_cls.from_pretrained(
+        modelname,
+        trust_remote_code=True,
+        dtype=torch.bfloat16,
+        device_map="auto",
+        **kwargs
+    ).eval()
+    
+    batch_pruning_time = 0.0
     
     try:
-        # Build user prompts and generate pruned embeddings
         user_prompts = []
         all_pruned_embeddings = []
-        
-
         for field_dict in fields:
-            # Initialize prompt with empty string - we'll build it from scratch
             user_prompt = ""
             pruned_embeddings_for_this_prompt = []
             
-            # Build prompt following the REORDERED column sequence
             for field_name in reordered_columns:
-                # Find the field type for this field name
                 field_type = None
                 for fname, ftype in typed_fields:
                     if fname == field_name:
@@ -85,7 +126,7 @@ def execute_batch_pope_with_pruned_embeddings(
                         break
                 
                 if field_type is None:
-                    continue  # Skip if field not found in typed_fields
+                    continue
                 if field_type == "text":
                     value = field_dict.get(field_name, "")
                     user_prompt += f"{field_name}: {value}\n"
@@ -95,29 +136,32 @@ def execute_batch_pope_with_pruned_embeddings(
                     image_data = field_dict.get(field_name)
                     
                     if image_data is not None:
+                        messages = [
+                            {
+                                "role": "user",
+                                "content": [
+                                    {"type": "image"},
+                                    {"type": "text", "text": "What is shown in this image?"},
+                                ],
+                            },
+                        ]
                         image_binary = extract_image_binary_from_pope_data(image_data)
-                        
+                        text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+                        inputs = processor(text=[text], images=[Image.open(io.BytesIO(image_binary))], return_tensors="pt").to(model.device)
                         if keep_ratio == 1:
-                            reduced_tokens, _, _ = getOriginalVisualToken(
+                            reduced_tokens = get_inputs_embeds(
                                 model,
-                                vision_tower,
-                                image_binary
+                                inputs
                             )
+                            record_timing(keep_ratio, 0, 0, 0.0)
            
                         else:
-                            # Time the pruning operation
-                            pruning_start = time.time()
-                            reduced_tokens, _, _, _ = trimTokenatorPruning(
+                            reduced_tokens, _, _, _ = get_inputs_embeds(
                                 model,
-                                vision_tower,
-                                tokenizer,
-                                image_binary,
-                                user_prompt,
-                                keep_ratio=keep_ratio
+                                inputs,
+                                576
                             )
-                            pruning_end = time.time()
-                            batch_pruning_time += (pruning_end - pruning_start)
-                            
+                            record_timing(keep_ratio, 0, 0, 0.0)
                         pruned_embeddings_for_this_prompt.append(reduced_tokens.to(torch.float16))
             
             user_prompts.append(user_prompt.strip())  # Remove trailing newline
@@ -129,18 +173,9 @@ def execute_batch_pope_with_pruned_embeddings(
         prompts = [_generate_prompt(user_prompt=user_prompt, system_prompt=system_prompt) 
                    for user_prompt in user_prompts]
         
-        answer_schema = {
-            "type": "object",
-            "properties": {"Answer": {"type": "string"}},
-            "required": ["Answer"]
-        }
-
         outputs = []
         if base_url:            
             async def fetch_all():
-                """
-                Concurrently runs all post_http_request_with_embeds calls.
-                """
                 tasks = []
                 for i, prompt in enumerate(prompts):
                     task = asyncio.to_thread(
@@ -150,7 +185,6 @@ def execute_batch_pope_with_pruned_embeddings(
                         temperature=0,
                         api_url=(base_url + "/chat/completions"),
                         guided_choice=guided_choice,
-                        answer_schema=answer_schema,
                         image_embeddings=[all_pruned_embeddings[i]] if all_pruned_embeddings[i] is not None else None
                     )
                     tasks.append(task)
@@ -179,14 +213,11 @@ def execute_batch_pope_with_pruned_embeddings(
                         
                 return processed_outputs
 
-            # Run the async main function from our synchronous context
-            # This will block until all concurrent requests are complete
             outputs = asyncio.run(fetch_all())            
             return outputs, batch_pruning_time
     
     finally:
         torch.cuda.empty_cache()
-
 
 def create_llm_udf_with_embeddings(
     keep_ratio: float
@@ -229,13 +260,14 @@ def create_llm_udf_with_embeddings(
         fields_list = merged_df.to_dict('records')
         
         outputs, batch_pruning_time = execute_batch_pope_with_pruned_embeddings(
-            modelname="llava-hf/llava-1.5-7b-hf",
+            modelname="Qwen/Qwen2.5-VL-7B-Instruct",
             fields=fields_list,
             query=prompt_template,
             keep_ratio=keep_ratio,
             typed_fields=typed_fields,
             reordered_columns=reordered_columns,
             system_prompt=DEFAULT_SYSTEM_PROMPT,
+            guided_choice=["Yes", "No"],
             base_url="http://localhost:8000/v1"
         )
         
@@ -259,7 +291,7 @@ def run_experiment(keep_ratio: float, dataset_name: str = "POPE_random") -> Tupl
     """Run experiment with specific keep_ratio and save results.
     Returns: (output_path, execution_time, pruning_time)
     """
-    global TOTAL_PRUNING_TIME
+    initialize_timing_csv(keep_ratio, dataset_name)
     
     print(f"\n{'='*80}")
     print(f"Running experiment with keep_ratio={keep_ratio}")
@@ -275,52 +307,42 @@ def run_experiment(keep_ratio: float, dataset_name: str = "POPE_random") -> Tupl
     spark.udf.register("LLM", llm_udf)
     
     # Read POPE parquet
-    POPE_PATH = "/scratch/hpc-prf-haqc/haikai/dataset/VQAText/validation-00000-of-00003.parquet"
-    pope_df = spark.read.parquet(POPE_PATH)
+    POPE_PATH = "/scratch/hpc-prf-haqc/haikai/dataset/POPE/random-00000-of-00001.parquet"
+    pope_df = spark.read.parquet(POPE_PATH).limit(10)
     pope_df.createOrReplaceTempView("pope")
+    print(f"Total records: {pope_df.count()}")
     
     # Execute query with proper column references
     result_df = spark.sql("""
         SELECT 
-            answers,
-            LLM('Given the question: {text:question} and image: {image:image}, give me the answer to the question', question, image) as predicted
+            id,
+            question_id,
+            question,
+            answer,
+            image_source,
+            LLM('Given the text: {text:question} and image: {image:image} give me the answer to the question', question, image) as predicted
         FROM pope
     """)
     
-    # Clean the predicted column to remove newlines and extra whitespace
-    result_df_cleaned = result_df.withColumn(
-        "predicted",
-        regexp_replace(col("predicted"), r"[\n\r]+", " ")  # Replace newlines with space
-    ).withColumn(
-        "predicted",
-        regexp_replace(col("predicted"), r"\s+", " ")  # Replace multiple spaces with single space
-    ).withColumn(
-        "predicted",
-        trim(col("predicted"))  # Trim leading/trailing whitespace
-    )
-
-    result_df_with_comparison = result_df_cleaned.withColumn(
-        "answer_text",
-        lower(trim(get_json_object(col("predicted"), "$.Answer")))
-    ).withColumn(
+    # Normalize both answer and predicted columns for comparison
+    result_df_with_comparison = result_df.withColumn(
         "is_correct",
         when(
-            expr("exists(answers, x -> lower(trim(answer_text)) like concat('%', lower(trim(x)), '%'))"),
+            lower(trim(col("predicted"))) == lower(trim(col("answer"))),
             1
         ).otherwise(0)
-    ).drop("answer_text", "answers")
+    ).drop("question")
     
-    # Write results to CSV with proper escaping
+    # Write results to CSV
     output_path = f"./{dataset_name}_{keep_ratio}.csv"
-    result_df_with_comparison.coalesce(1).write.mode("overwrite") \
-        .option("header", "true") \
-        .option("quote", '"') \
-        .option("escape", '"') \
-        .csv(output_path)
+    result_df_with_comparison.coalesce(1).write.mode("overwrite").option("header", "true").csv(output_path)
     
     end_time = time.time()
     execution_time = end_time - start_time
     pruning_time = 0
+    if TIMING_CSV_FILE and os.path.exists(TIMING_CSV_FILE):
+        timing_df = pd.read_csv(TIMING_CSV_FILE)
+        pruning_time = timing_df['total_time'].sum()
     
     print(f"\nExecution time for keep_ratio={keep_ratio}: {execution_time:.2f} seconds")
     print(f"Pruning time for keep_ratio={keep_ratio}: {pruning_time:.2f} seconds")
@@ -382,8 +404,8 @@ def calculate_accuracy(csv_path: str, keep_ratio: float) -> float:
 
 # Main execution
 if __name__ == "__main__":
-    keep_ratios = [1, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1]
-    dataset_name = "vqatext_trim"
+    keep_ratios = [1]
+    dataset_name = "POPE_qwenvl25"
     
     overall_start = time.time()
     results = {}
