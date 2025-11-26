@@ -408,7 +408,7 @@ def getOriginalVisualToken(model, vision_tower, image_binary):
     encode_end = time.time()
     encode_time = encode_end - encode_begin
 
-    return image_features.squeeze(0),preprocess_time,encode_time
+    return image_features,preprocess_time,encode_time
 
 
 def process_text_efficiently(texts, vision_tower, model_device):

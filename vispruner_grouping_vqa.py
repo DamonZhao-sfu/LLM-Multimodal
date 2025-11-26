@@ -107,29 +107,23 @@ def preprocess_and_cache_pruned_embeddings(
                     f"{questions_text}"
                 )
                 
-                #print(f"  Combined guidance length: {len(combined_guidance)} chars")
-                #print(f"  Sample questions: {all_questions[:2]}...")
-                
-                # Prune image with combined guidance
-                #print(f"  🔧 Pruning image...")
                 prune_start = time.time()
                 
                 if keep_ratio == 1:
                     # No pruning, use original tokens
-                    reduced_tokens = getOriginalVisualToken(
-                        model,
-                        vision_tower,
-                        image_binary
+                    reduced_tokens, preprocess_time, encode_time = getOriginalVisualToken(
+                                model,
+                                vision_tower,
+                                image_binary
                     )
                 else:
                     # Prune with combined guidance
-                    reduced_tokens = trimTokenatorPruning(
-                        model,
-                        vision_tower,
-                        tokenizer,
-                        image_binary,
-                        combined_guidance,
-                        keep_ratio=keep_ratio
+                    reduced_tokens, preprocess_time, encode_time, prune_time = getPrunedVisualTokenVisPruner_optimized(
+                                model,
+                                vision_tower,
+                                image_binary,
+                                all_questions,
+                                keep_ratio=keep_ratio
                     )
                 
                 prune_end = time.time()
@@ -147,11 +141,6 @@ def preprocess_and_cache_pruned_embeddings(
                 }
                 
                 successful_prunes += 1
-                
-                # print(f"  ✅ Pruning successful!")
-                # print(f"  📊 Original: 576 tokens → Pruned: {reduced_tokens.shape[1]} tokens")
-                # print(f"  📉 Reduction: {((576 - reduced_tokens.shape[1]) / 576 * 100):.1f}%")
-                # print(f"  ⏱️  Time: {prune_time:.2f}s")
                 
             except Exception as e:
                 failed_prunes += 1
@@ -227,25 +216,6 @@ def inference_with_cached_embeddings(
     
     # Send requests to API
     outputs = []
-    
-    # for i, prompt in enumerate(prompts):
-    #     response = post_http_request_with_embeds(
-    #         modelname,
-    #         [prompt],
-    #         temperature=0,
-    #         api_url=(base_url + "/chat/completions"),
-    #         guided_choice=guided_choice,
-    #         answer_schema=answer_schema,
-    #         image_embeddings=[all_pruned_embeddings[i]] if all_pruned_embeddings[i] is not None else None
-    #     )
-        
-    #     request_output = json.loads(response.content)
-    #     choices = request_output.get('choices', [])
-        
-    #     if choices and 'message' in choices[0] and 'content' in choices[0]['message']:
-    #         outputs.append(choices[0]['message']['content'])
-    #     else:
-    #         outputs.append(None)
     async def fetch_all():
         tasks = []
         for i, prompt in enumerate(prompts):
@@ -316,7 +286,7 @@ def create_llm_udf_with_cached_embeddings(embedding_cache: Dict[str, Dict], imag
         fields_list = merged_df.to_dict('records')
 
         outputs = inference_with_cached_embeddings(
-            modelname="/data/models/llava-1.5-7b-hf",
+            modelname="llava-hf/llava-1.5-7b-hf",
             fields=fields_list,
             query=prompt_template,
             typed_fields=typed_fields,
@@ -449,13 +419,13 @@ def calculate_accuracy(csv_path: str, keep_ratio: float) -> float:
 
 # Main execution
 if __name__ == "__main__":
-    keep_ratios = [1, 0.222, 0.111, 0.056]
+    keep_ratios = [1, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1]
     dataset_name = "vqa_trim_grouping"
     
     overall_start = time.time()
     
     # Read POPE parquet once
-    POPE_PATH = "/home/haikai/LLM-Multimodal/VQAv2/validation-00000-of-00068.parquet"
+    POPE_PATH = "/scratch/hpc-prf-haqc/haikai/dataset/VQAv2/validation-00000-of-00068.parquet"
     pope_df = spark.read.parquet(POPE_PATH)
     pope_df.createOrReplaceTempView("pope")
     

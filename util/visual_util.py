@@ -102,7 +102,6 @@ def get_image_features(model, inputs, **kwargs):
     """
     pixel_values = inputs.pixel_values
     image_num_patches = None
-    print("architecture " + model.config.architectures)
     if "LlavaNextForConditionalGeneration" in model.config.architectures and pixel_values.dim() == 5:
         from transformers.models.llava_next.modeling_llava_next import image_size_to_num_patches
 
@@ -247,4 +246,222 @@ def get_inputs_embeds(model, inputs, num_keep_tokens=None, theta=0.5):
     kept_mask = kept_mask.unsqueeze(-1).expand_as(inputs_embeds)
     pruned_embeds = inputs_embeds_with_images[kept_mask].view(B, -1, emb_dim)
     
+    return pruned_embeds.to(device)
+
+
+def get_trimtokenator_mask(image_embeds, text_embeds, special_image_mask, keep_ratio=0.25, stage1_ratio=0.8):
+    """
+    Generate a mask to retain image tokens based on TrimTokenator two-stage pruning.
+    
+    Stage 1: Cross-modal alignment - retain tokens with highest mutual information with text
+    Stage 2: Greedy intra-modal diversity - maximize expected pairwise distances
+    """
+    keep_indices = []
+    offset = 0
+    
+    # Process each image embedding
+    for image_emb in image_embeds:
+        device = image_emb.device
+        
+        # Handle different input shapes
+        if image_emb.dim() == 2:
+            # Shape is [N, C], add batch dimension
+            image_emb = image_emb.unsqueeze(0)  # [1, N, C]
+        
+        B, N, C = image_emb.shape
+        
+        # Calculate N1 (tokens after stage 1) and N2 (final tokens)
+        N1 = int(stage1_ratio * N)
+        N2 = int(keep_ratio * N)
+        
+        # Safety check: ensure N1 and N2 are valid
+        N1 = max(1, min(N1, N))
+        N2 = max(1, min(N2, N1))
+        
+        # ============================================================================
+        # STAGE 1: Cross-Modal Alignment (Mutual Information via L2 norm)
+        # ============================================================================
+        if text_embeds is not None and text_embeds.numel() > 0:
+            M = text_embeds.shape[0]  # Number of text tokens
+            
+            # Compute pairwise distances
+            pairwise_distances = torch.cdist(
+                image_emb,
+                text_embeds.unsqueeze(0),
+                p=2.0
+            ) ** 2  # [B, N, M]
+            
+            # Average L2 distance over text tokens (negative for "higher is better")
+            alignment_scores = -pairwise_distances.mean(dim=2)  # [B, N]
+        else:
+            # No text: uniform relevance (all tokens equally important)
+            alignment_scores = torch.ones(B, N, device=device)
+        
+        # Select top N1 tokens based on alignment scores
+        _, top_indices_stage1 = torch.topk(alignment_scores, k=N1, dim=1)  # [B, N1]
+        
+        # Gather selected tokens for stage 2
+        batch_indices = torch.arange(B, device=device).unsqueeze(1).expand(-1, N1)
+        X_v1 = image_emb[batch_indices, top_indices_stage1]  # [B, N1, C]
+        
+        # ============================================================================
+        # STAGE 2: Greedy Intra-Modal Diversity Maximization (RepMax)
+        # ============================================================================
+        
+        # Normalize tokens for cosine similarity computation
+        X_v1_norm = X_v1 / (X_v1.norm(dim=-1, keepdim=True) + 1e-8)
+        
+        # Compute similarity matrix
+        similarity_matrix = torch.matmul(X_v1_norm, X_v1_norm.transpose(1, 2))  # [B, N1, N1]
+        
+        # Initialize selection
+        selected_indices = []
+        remaining_mask = torch.ones(B, N1, dtype=torch.bool, device=device)
+        
+        # Greedy algorithm for N2 iterations
+        for t in range(N2):
+            if t == 0:
+                # Initial: select token with lowest average similarity to all others
+                avg_similarity = similarity_matrix.sum(dim=2) / N1  # [B, N1]
+                avg_similarity[~remaining_mask] = float('inf')  # Mask already selected
+                initial_idx = avg_similarity.argmin(dim=1)  # [B]
+                selected_indices.append(initial_idx)
+                
+                # Update cumulative similarity vector
+                batch_range = torch.arange(B, device=device)
+                sigma = similarity_matrix[batch_range, initial_idx, :]  # [B, N1]
+                
+                # Mark as selected
+                remaining_mask[batch_range, initial_idx] = False
+            else:
+                # Compute average similarity to selected set
+                avg_sim_to_selected = sigma / t  # [B, N1]
+                avg_sim_to_selected[~remaining_mask] = float('inf')  # Mask selected tokens
+                
+                # Select token with minimum average similarity
+                next_idx = avg_sim_to_selected.argmin(dim=1)  # [B]
+                selected_indices.append(next_idx)
+                
+                # Update cumulative similarity
+                batch_range = torch.arange(B, device=device)
+                sigma = sigma + similarity_matrix[batch_range, next_idx, :]  # [B, N1]
+                
+                # Mark as selected
+                remaining_mask[batch_range, next_idx] = False
+        
+        # Stack selected indices
+        selected_stage2 = torch.stack(selected_indices, dim=1)  # [B, N2]
+        
+        # Map back to original indices
+        batch_indices_final = torch.arange(B, device=device).unsqueeze(1).expand(-1, N2)
+        final_original_indices = top_indices_stage1[batch_indices_final, selected_stage2]
+        
+        # Sort indices to maintain spatial order
+        final_original_indices_sorted, _ = torch.sort(final_original_indices, dim=1)
+        
+        # Add offset and collect indices
+        keep_indices.append(final_original_indices_sorted.squeeze(0) + offset)
+        offset += N
+    
+    # Concatenate all keep indices
+    keep_indices = torch.cat(keep_indices, dim=0)
+    
+    # Get the positions of the selected image tokens
+    image_token_positions = torch.nonzero(special_image_mask[0], as_tuple=False).squeeze(1)
+    kept_positions = image_token_positions[keep_indices]
+    
+    # Build mask to keep: original text + selected image tokens
+    kept_mask = ~special_image_mask
+    kept_mask[0, kept_positions] = True
+    
+    return kept_mask
+
+
+@torch.no_grad()
+def get_inputs_embeds_trim(model, inputs, keep_ratio=0.25, stage1_ratio=0.8):
+    """
+    Get input embeddings with TrimTokenator pruning applied to image tokens.
+    
+    Args:
+        model: The multimodal model
+        inputs: Input data containing input_ids and pixel_values
+        keep_ratio: Final ratio of image tokens to keep (default: 0.25 = 25%)
+        stage1_ratio: Ratio for stage 1 pruning (default: 0.8 = 80%)
+    
+    Returns:
+        Pruned input embeddings as 2D tensor [seq_len, emb_dim]
+    """
+    # Determine device and move inputs
+    device = model.get_input_embeddings().weight.device
+    
+    # Move the input_ids to that device
+    input_ids = inputs.input_ids.to(device)
+    
+    # Move pixel_values
+    if hasattr(inputs, 'pixel_values') and inputs.pixel_values is not None:
+        inputs.pixel_values = inputs.pixel_values.to(device)
+    
+    # Get model-specific kwargs
+    kwargs = {}
+    if hasattr(inputs, 'image_sizes'):
+        kwargs['image_sizes'] = inputs.image_sizes
+    if hasattr(inputs, 'image_grid_thw'):
+        kwargs['image_grid_thw'] = inputs.image_grid_thw
+    
+    # Get input embeddings
+    inputs_embeds = model.get_input_embeddings()(input_ids)
+    
+    B, _, emb_dim = inputs_embeds.shape
+    assert B == 1, "Batch size must be 1"
+    
+    # Identify image token positions
+    image_token_id = torch.tensor(model.config.image_token_id, dtype=torch.long, device=device)
+    special_image_emb = model.get_input_embeddings()(image_token_id)
+    special_image_mask = (inputs_embeds == special_image_emb).all(-1)
+    
+    # Get image embeddings
+    image_embeds = model.get_image_features(
+        pixel_values=inputs.pixel_values,
+        **kwargs,
+    )
+    
+    # Ensure image_embeds are 3D [1, N, C] or list of [N, C]
+    processed_image_embeds = []
+    for img_emb in image_embeds:
+        if img_emb.dim() == 2:
+            # [N, C] -> add batch dimension
+            processed_image_embeds.append(img_emb.unsqueeze(0))
+        elif img_emb.dim() == 3:
+            processed_image_embeds.append(img_emb)
+        else:
+            raise ValueError(f"Unexpected image embedding shape: {img_emb.shape}")
+    
+    # Flatten for insertion: concatenate all image tokens
+    flat_image_embeds = torch.cat([emb.reshape(-1, emb_dim) for emb in processed_image_embeds], dim=0)
+    flat_image_embeds = flat_image_embeds.to(device, inputs_embeds.dtype)
+    
+    exp_special_image_mask = special_image_mask.unsqueeze(-1).expand_as(inputs_embeds)
+    inputs_embeds_with_images = inputs_embeds.masked_scatter(exp_special_image_mask, flat_image_embeds)
+    
+    # If no pruning requested, return as 2D tensor
+    if keep_ratio is None or keep_ratio >= 1.0:
+        return inputs_embeds_with_images.squeeze(0)  # [seq_len, emb_dim]
+    
+    # Extract text embeddings for alignment computation
+    text_embeds = inputs_embeds[~special_image_mask].view(-1, emb_dim)
+    
+    # Apply TrimTokenator pruning (pass the processed embeddings)
+    kept_mask = get_trimtokenator_mask(
+        processed_image_embeds, 
+        text_embeds, 
+        special_image_mask, 
+        keep_ratio=keep_ratio,
+        stage1_ratio=stage1_ratio
+    )
+    
+    # Apply mask to keep selected tokens
+    kept_mask = kept_mask.unsqueeze(-1).expand_as(inputs_embeds)
+    pruned_embeds = inputs_embeds_with_images[kept_mask].view(B, -1, emb_dim)
+    
+    # Return as 2D tensor [seq_len, emb_dim]
     return pruned_embeds.to(device)

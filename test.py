@@ -4,10 +4,23 @@ import torch
 
 if __name__ == "__main__":
     # Initialize the LLM only if this is the main process
+    
+    scratch_path = "/scratch/hpc-prf-haqc"
+    user_path = f"{scratch_path}/haikai"
+
+    os.environ["HF_HOME"] = f"{user_path}/hf-cache"
+    os.environ["VLLM_CACHE_DIR"] = f"{user_path}/vllm-cache"
+    os.environ["TORCH_COMPILE_CACHE"] = f"{user_path}/vllm-cache/torch_compile_cache"
+    os.environ["TRANSFORMERS_CACHE"] = f"{user_path}/hf-cache"
+
+    os.environ["TRITON_CACHE_DIR"] = f"{scratch_path}/vllm-compile-cache"
+    os.environ["TORCHINDUCTOR_CACHE_DIR"] = f"{scratch_path}/vllm-compile-cache"
+
     # llava-hf/llava-1.5-7b-hf
     # llava-hf/llava-v1.6-mistral-7b-hf
     llm = LLM(model="llava-hf/llava-v1.6-mistral-7b-hf", 
             trust_remote_code=True,
+            enable_mm_embeds=True,
             download_dir=os.environ["HF_HOME"])
 
     prompt = "USER: <image>\nWhat is this image?\nASSISTANT:"
@@ -18,7 +31,7 @@ if __name__ == "__main__":
     #image_embeds = torch.zeros((16, model_config.hf_config.text_config.hidden_size))
     
     # case 3
-    image_embeds = [torch.zeros(16, 1024)]
+    image_embeds = [torch.zeros(16, 4096)]
     
 
     # 2. Wrap it in MultiModalEmbedding
@@ -106,13 +119,3 @@ if __name__ == "__main__":
 
 # It is safe (and often recommended) to keep environment setup global 
 # so spawned processes inherit these settings if they import the module.
-# scratch_path = "/scratch/hpc-prf-haqc"
-# user_path = f"{scratch_path}/haikai"
-
-# os.environ["HF_HOME"] = f"{user_path}/hf-cache"
-# os.environ["VLLM_CACHE_DIR"] = f"{user_path}/vllm-cache"
-# os.environ["TORCH_COMPILE_CACHE"] = f"{user_path}/vllm-cache/torch_compile_cache"
-# os.environ["TRANSFORMERS_CACHE"] = f"{user_path}/hf-cache"
-
-# os.environ["TRITON_CACHE_DIR"] = f"{scratch_path}/vllm-compile-cache"
-# os.environ["TORCHINDUCTOR_CACHE_DIR"] = f"{scratch_path}/vllm-compile-cache"

@@ -7,7 +7,22 @@ export TRANSFORMERS_CACHE=$HF_HOME
 export TRITON_CACHE_DIR=/scratch/hpc-prf-haqc/vllm-compile-cache
 export TORCHINDUCTOR_CACHE_DIR=/scratch/hpc-prf-haqc/vllm-compile-cache
 
-vllm serve "llava-hf/llava-1.5-7b-hf" --gpu-memory-utilization 0.5 >  vllm_server.log 2>&1 &
+# Load and run the model:
+vllm serve # Load and run the model:
+
+# Load and run the model:
+vllm serve "lmms-lab/LLaVA-OneVision-1.5-8B-Instruct" --gpu-memory-utilization 0.8 --enable-mm-embeds --trust_remote_code True>  vllm_server.log 2>&1 &
+
+vllm serve "llava-hf/llava-onevision-qwen2-7b-ov-hf" --gpu-memory-utilization 0.8 --enable-mm-embeds >  vllm_server.log 2>&1 &
+
+vllm serve "llava-hf/llava-1.5-7b-hf" --gpu-memory-utilization 0.8  >  vllm_server.log 2>&1 &
+
+vllm serve "llava-hf/llava-v1.6-mistral-7b-hf" --gpu-memory-utilization 0.8 --enable-mm-embeds >  vllm_server.log 2>&1 &
+
+CUDA_VISIBLE_DEVICES="0,1" vllm serve "Qwen/Qwen2.5-VL-7B-Instruct" \
+  --tensor-parallel-size 2 \
+  --gpu-memory-utilization 0.8 \
+  > vllm_server.log 2>&1 &
 
 
 cd vllm

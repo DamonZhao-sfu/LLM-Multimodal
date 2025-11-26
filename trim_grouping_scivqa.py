@@ -434,7 +434,7 @@ def create_llm_udf_with_cached_embeddings(embedding_cache: Dict[str, Dict], imag
         fields_list = merged_df.to_dict('records')
 
         outputs = inference_with_cached_embeddings(
-            modelname="/data/models/llava-1.5-7b-hf",
+            modelname="llava-hf/llava-1.5-7b-hf",
             fields=fields_list,
             query=prompt_template,
             typed_fields=typed_fields,
@@ -580,13 +580,13 @@ def calculate_accuracy(csv_path: str, keep_ratio: float) -> float:
 
 # Main execution
 if __name__ == "__main__":
-    keep_ratios = [1, 0.222, 0.111, 0.056]
-    dataset_name = "SciVQA_trim"
+    keep_ratios = [1,0.9,0.8,0.7,0.6,0.5,0.4,0.3,0.2,0.1]
+    dataset_name = "SciVQA_grouping_trim"
     
     overall_start = time.time()
     
     # Read POPE parquet once
-    POPE_PATH = "/home/haikai/train_2025-07-03_09-06.json"
+    POPE_PATH = "/scratch/hpc-prf-haqc/haikai/dataset/scivqa/train_2025-07-03_09-06.json"
     pope_df = spark.read \
         .option("multiLine", "true") \
         .option("encoding", "UTF-8") \

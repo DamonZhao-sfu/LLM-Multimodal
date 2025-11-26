@@ -104,43 +104,13 @@ def execute_batch_pope_with_pruned_embeddings(
     vision_tower, model, processor = load_vision_models_llava_next(device='cuda')
     
     user_prompts = []
-    all_pruned_embeddings = []
     batch_pruning_time = 0.0
     
-        # --- PHASE 2: Inference (vLLM) ---
-    print("Phase 2: Loading vLLM Engine...")
-    
-    
-    scratch_path = "/scratch/hpc-prf-haqc"
-    user_path = f"{scratch_path}/haikai"
-
-    # Set the variables
-    os.environ["HF_HOME"] = f"{user_path}/hf-cache"
-    os.environ["VLLM_CACHE_DIR"] = f"{user_path}/vllm-cache"
-    os.environ["TORCH_COMPILE_CACHE"] = f"{user_path}/vllm-cache/torch_compile_cache"
-    os.environ["TRANSFORMERS_CACHE"] = f"{user_path}/hf-cache"
-
-    # Triton/Inductor caches (Critical for vllm performance/compilation)
-    os.environ["TRITON_CACHE_DIR"] = f"{scratch_path}/vllm-compile-cache"
-    os.environ["TORCHINDUCTOR_CACHE_DIR"] = f"{scratch_path}/vllm-compile-cache"
 
     # -----------------------------------------------------------------------
     # 2. NOW IMPORT AND INITIALIZE VLLM
     # -----------------------------------------------------------------------
     # It is safe to import vllm now that the paths are set
-    from vllm import LLM as VllmEngine 
-    from vllm import SamplingParams
-
-    # Initialize
-    llm = VllmEngine(
-        model=modelname,
-        limit_mm_per_prompt={"image": 1},
-        trust_remote_code=True,
-        gpu_memory_utilization=0.5, 
-        enforce_eager=True,
-        enable_mm_embeds=True,
-        download_dir=os.environ["HF_HOME"] # Explicitly enforce it here too just in case
-    )
     final_results = []
     try:
         for field_dict in fields:
@@ -162,45 +132,32 @@ def execute_batch_pope_with_pruned_embeddings(
                     image_data = field_dict.get(field_name)
                     if image_data is not None:
                         image_binary = extract_image_binary_from_pope_data(image_data)
-                        messages = [
-                            {
-                                "role": "user",
-                                "content": [{"type": "text", "text": ""}, {"type": "image", "image": Image.open(io.BytesIO(image_binary))}],
-                            }
-                        ]
-                        #prompt = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-                        # Process Image
-                        #inputs = processor(text="<image>", images=Image.open(io.BytesIO(image_binary)), return_tensors="pt")
+                        inputs = processor(text="<image>", images=Image.open(io.BytesIO(image_binary)), return_tensors="pt")
                         
-                        #reduced_tokens = get_inputs_embeds(model, inputs)
+                        #reduced_tokens = get_inputs_embeds(model, inputs, num_keep_tokens=128)
                         
+                        reduced_tokens = get_inputs_embeds_trim(model, inputs, keep_ratio=0.25)
+                        print(reduced_tokens.shape)
                         full_prompt = _generate_prompt(user_prompt=user_prompt, system_prompt=system_prompt)
 
-                        #embed_tensor = reduced_tokens[0].detach().cpu()  # Changed this line
+                        embed_tensor = [reduced_tokens[0].detach().cpu()]  # Changed this line
                         
-                        #print(f"Embed tensor shape: {embed_tensor.shape}")  # Should be [num_tokens, hidden_dim]
-                        #print(f"Embed tensor dim: {embed_tensor.dim()}")    # Should be 2
-                        #case 1: 3D tensor
-                        #image_embeds = torch.randn(1, 16, 1024)
-
-                        #case 2: 2D tensor
-                        #image_embeds = torch.randn(16, 1024)
-
-                        #case 3: list of 2D tensor
-                        image_embeds = [torch.randn(16, 1024)]
-
-                        #case 4: list of 3D tensor
-                        #image_embeds = [torch.randn(1, 16, 1024)]
-
-                        input_item = {
-                            "prompt": "",
-                            "multi_modal_data": {
-                                "image": image_embeds
-                            }
-                        }
-                        outputs = llm.generate(input_item)
-                        for o in outputs:
-                            final_results.append(o.outputs[0].text)
+                        response = post_http_request_with_embeds(
+                            modelname,
+                            [full_prompt],
+                            temperature=0,
+                            api_url=(base_url + "/chat/completions"),
+                            guided_choice=guided_choice,
+                            image_embeddings=[embed_tensor]
+                        )
+                        
+                        request_output = json.loads(response.content)
+                        choices = request_output.get('choices', [])
+                        
+                        if choices and 'message' in choices[0] and 'content' in choices[0]['message']:
+                            final_results.append(choices[0]['message']['content'])
+                        else:
+                            final_results.append(None)
 
             user_prompts.append(user_prompt.strip())
             # Store only the first image embedding found (assuming 1 image per prompt based on your logic)
@@ -260,7 +217,7 @@ def create_llm_udf_with_embeddings(
         fields_list = merged_df.to_dict('records')
         
         outputs, batch_pruning_time = execute_batch_pope_with_pruned_embeddings(
-            modelname="llava-hf/llava-onevision-qwen2-7b-ov-hf",
+            modelname="llava-hf/llava-v1.6-mistral-7b-hf",
             fields=fields_list,
             query=prompt_template,
             keep_ratio=keep_ratio,
@@ -268,7 +225,6 @@ def create_llm_udf_with_embeddings(
             reordered_columns=reordered_columns,
             system_prompt=DEFAULT_SYSTEM_PROMPT,
             guided_choice=["Yes", "No"],
-            trust_remote_code=True,
             base_url="http://localhost:8000/v1"
         )
         
