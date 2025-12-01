@@ -5,7 +5,9 @@
 import numpy as np
 import torch
 import torch.nn.functional as F
-
+from PIL import Image
+import io
+import time
 
 def get_visual_similarity(image_features):
     """
@@ -201,7 +203,7 @@ def get_cdpruner_mask(image_embeds, image_features, text_embeds, special_image_m
     return kept_mask
 
 @torch.no_grad()
-def get_inputs_embeds(model, inputs, num_keep_tokens=None, theta=0.5):
+def get_inputs_embeds(model, inputs, keep_ratio, theta=0.5):
     # --- FIX START: Determine device and move inputs ---
     # 1. Get the device the model is currently on
     device = model.get_input_embeddings().weight.device
@@ -219,7 +221,7 @@ def get_inputs_embeds(model, inputs, num_keep_tokens=None, theta=0.5):
     # Use the moved input_ids here
     inputs_embeds = model.get_input_embeddings()(input_ids) 
     
-    B, _, emb_dim = inputs_embeds.shape
+    B, token, emb_dim = inputs_embeds.shape
     assert B == 1
 
     # Ensure image_token_id is on the correct device
@@ -236,11 +238,12 @@ def get_inputs_embeds(model, inputs, num_keep_tokens=None, theta=0.5):
     exp_special_image_mask = special_image_mask.unsqueeze(-1).expand_as(inputs_embeds)
     inputs_embeds_with_images = inputs_embeds.masked_scatter(exp_special_image_mask, flat_image_embeds)
 
-    if num_keep_tokens is None:
+    if keep_ratio == 1:
         return inputs_embeds_with_images
 
     text_embeds = inputs_embeds[~special_image_mask].view(-1, emb_dim)
     image_features = [feat.to(device) for feat in get_image_features(model, inputs, **kwargs)]
+    num_keep_tokens = int(token * keep_ratio)
     kept_mask = get_cdpruner_mask(image_embeds, image_features, text_embeds, special_image_mask, num_keep_tokens, theta)
 
     kept_mask = kept_mask.unsqueeze(-1).expand_as(inputs_embeds)
@@ -378,29 +381,21 @@ def get_trimtokenator_mask(image_embeds, text_embeds, special_image_mask, keep_r
 
 
 @torch.no_grad()
-def get_inputs_embeds_trim(model, inputs, keep_ratio=0.25, stage1_ratio=0.8):
-    """
-    Get input embeddings with TrimTokenator pruning applied to image tokens.
-    
-    Args:
-        model: The multimodal model
-        inputs: Input data containing input_ids and pixel_values
-        keep_ratio: Final ratio of image tokens to keep (default: 0.25 = 25%)
-        stage1_ratio: Ratio for stage 1 pruning (default: 0.8 = 80%)
-    
-    Returns:
-        Pruned input embeddings as 2D tensor [seq_len, emb_dim]
-    """
+def get_inputs_embeds_trim(model, processor, image_binary, keep_ratio=0.25, stage1_ratio=0.8):
     # Determine device and move inputs
     device = model.get_input_embeddings().weight.device
-    
+    preprocess_time_begin = time.time()
+    inputs = processor(text="<image>", images=Image.open(io.BytesIO(image_binary)), return_tensors="pt")
     # Move the input_ids to that device
     input_ids = inputs.input_ids.to(device)
-    
+  
     # Move pixel_values
     if hasattr(inputs, 'pixel_values') and inputs.pixel_values is not None:
         inputs.pixel_values = inputs.pixel_values.to(device)
-    
+    preprocess_time_end = time.time()
+    preprocess_time = preprocess_time_end - preprocess_time_begin
+
+    encode_time_begin = time.time()
     # Get model-specific kwargs
     kwargs = {}
     if hasattr(inputs, 'image_sizes'):
@@ -442,11 +437,15 @@ def get_inputs_embeds_trim(model, inputs, keep_ratio=0.25, stage1_ratio=0.8):
     
     exp_special_image_mask = special_image_mask.unsqueeze(-1).expand_as(inputs_embeds)
     inputs_embeds_with_images = inputs_embeds.masked_scatter(exp_special_image_mask, flat_image_embeds)
-    
+    encode_time_end = time.time()
+    encode_time = encode_time_end - encode_time_begin
+
     # If no pruning requested, return as 2D tensor
     if keep_ratio is None or keep_ratio >= 1.0:
-        return inputs_embeds_with_images.squeeze(0)  # [seq_len, emb_dim]
-    
+        return inputs_embeds_with_images.squeeze(0), preprocess_time, encode_time, 0
+
+
+    prune_time_begin = time.time()
     # Extract text embeddings for alignment computation
     text_embeds = inputs_embeds[~special_image_mask].view(-1, emb_dim)
     
@@ -462,6 +461,7 @@ def get_inputs_embeds_trim(model, inputs, keep_ratio=0.25, stage1_ratio=0.8):
     # Apply mask to keep selected tokens
     kept_mask = kept_mask.unsqueeze(-1).expand_as(inputs_embeds)
     pruned_embeds = inputs_embeds_with_images[kept_mask].view(B, -1, emb_dim)
-    
+    prune_time_end = time.time()
+    prune_time = prune_time_end - prune_time_begin
     # Return as 2D tensor [seq_len, emb_dim]
-    return pruned_embeds.to(device)
+    return pruned_embeds.squeeze(0).to(device), preprocess_time, encode_time, prune_time

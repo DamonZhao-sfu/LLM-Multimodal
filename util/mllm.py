@@ -65,19 +65,7 @@ def load_vision_models_llava_next(device='cuda'):
     
     # Set CUDA device
     #torch.cuda.set_device(0)
-    vision_tower_name = "/scratch/hpc-prf-haqc/haikai/hf-cache/models--openai--clip-vit-large-patch14-336/snapshots/ce19dc912ca5cd21c8a653c79e251e808ccabcd1"  # Default CLIP model
     MODEL_PATH = "llava-hf/llava-v1.6-mistral-7b-hf"
-
-    class MockArgs:
-        def __init__(self):
-            self.mm_vision_select_layer = -2
-            self.mm_vision_select_feature = 'patch'
-    
-    mock_args = MockArgs()
-    vision_tower = CLIPVisionTower(vision_tower_name, mock_args, delay_load=False)
-    vision_tower = vision_tower.to('cuda')
-    vision_tower.vision_tower.config._attn_implementation = "eager"
-    vision_tower.vision_tower.config.output_attentions = True
     model = LlavaNextForConditionalGeneration.from_pretrained(
         MODEL_PATH, 
         torch_dtype=torch.float16, 
@@ -91,7 +79,7 @@ def load_vision_models_llava_next(device='cuda'):
     
     print(f"[Model Loading] Vision tower loaded successfully on {device}")
     
-    return vision_tower, model, processor
+    return tokenizer, model, processor
 
 def get_model_class(model_name):
     if "Qwen2.5-VL" in model_name:
@@ -699,8 +687,7 @@ def post_http_request_with_embeds(
         })
         
         if image_embeddings:
-            embedding_data = image_embeddings[i]
-            embedding = encode_image_embedding_to_base64(embedding_data)
+            embedding = encode_image_embedding_to_base64(image_embeddings[i])
             content.append({
                 "type": "image_embeds",
                 "image_embeds": embedding
@@ -716,7 +703,6 @@ def post_http_request_with_embeds(
         "messages": messages_list,
         "temperature": temperature,
     }
-    
     # Add guided_json only if answer_schema is provided
     if answer_schema is not None:
         pload["guided_json"] = answer_schema

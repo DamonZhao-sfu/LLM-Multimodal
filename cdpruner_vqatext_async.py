@@ -35,6 +35,7 @@ spark = SparkSession.builder \
     .config("spark.dynamicAllocation.enabled", "false") \
     .config("spark.default.parallelism", "1") \
     .config("spark.sql.shuffle.partitions", "1") \
+    .config("spark.sql.execution.arrow.maxRecordsPerBatch", "1000") \
     .config("spark.driver.maxResultSize", "4g") \
     .config("spark.sql.execution.arrow.pyspark.enabled", "true") \
     .config("spark.executor.memoryOverhead", "16g") \
@@ -264,7 +265,7 @@ def create_llm_udf_with_embeddings(
         fields_list = merged_df.to_dict('records')
         
         outputs = execute_batch_pope_with_pruned_embeddings(
-            modelname="/data/models/llava-1.5-7b-hf",
+            modelname="llava-hf/llava-1.5-7b-hf",
             fields=fields_list,
             query=prompt_template,
             keep_ratio=keep_ratio,

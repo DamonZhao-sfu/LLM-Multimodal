@@ -4,11 +4,8 @@ import time
 import pandas as pd
 from typing import Tuple, List, Dict, Any
 import json
-import asyncio
 import csv
 from util.utils import _generate_prompt
-from vllm import LLM as VllmEngine # <--- Rename here to avoid collisions
-from vllm import SamplingParams
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import pandas_udf, col, when, lower, trim
 from pyspark.sql.types import StringType
@@ -101,7 +98,7 @@ def execute_batch_pope_with_pruned_embeddings(
     
     # --- PHASE 1: Pruning / Embedding Generation (PyTorch) ---
     print("Phase 1: Loading Vision Model for Pruning...")
-    vision_tower, model, processor = load_vision_models_llava_next(device='cuda')
+    tokenizer, model, processor = load_vision_models_llava_next(device='cuda')
     
     user_prompts = []
     batch_pruning_time = 0.0
@@ -132,15 +129,10 @@ def execute_batch_pope_with_pruned_embeddings(
                     image_data = field_dict.get(field_name)
                     if image_data is not None:
                         image_binary = extract_image_binary_from_pope_data(image_data)
-                        inputs = processor(text="<image>", images=Image.open(io.BytesIO(image_binary)), return_tensors="pt")
-                        
-                        #reduced_tokens = get_inputs_embeds(model, inputs, num_keep_tokens=128)
-                        
-                        reduced_tokens = get_inputs_embeds_trim(model, inputs, keep_ratio=0.25)
-                        print(reduced_tokens.shape)
+                        reduced_tokens, _, _, _ = get_inputs_embeds_trim(model, processor, image_binary, keep_ratio=keep_ratio)
                         full_prompt = _generate_prompt(user_prompt=user_prompt, system_prompt=system_prompt)
 
-                        embed_tensor = [reduced_tokens[0].detach().cpu()]  # Changed this line
+                        embed_tensor = [reduced_tokens.detach().cpu()]  # Changed this line
                         
                         response = post_http_request_with_embeds(
                             modelname,
@@ -169,9 +161,6 @@ def execute_batch_pope_with_pruned_embeddings(
         # --- MEMORY MANAGEMENT ---
         # We MUST destroy the PyTorch model to free up VRAM for vLLM
         print("Phase 1 Complete. Unloading PyTorch model to free VRAM...")
-        del vision_tower
-        del model
-        del processor
         torch.cuda.empty_cache()
 
     return final_results, batch_pruning_time
@@ -254,9 +243,7 @@ def run_experiment(keep_ratio: float, dataset_name: str = "POPE_random") -> Tupl
     print(f"Running experiment with keep_ratio={keep_ratio}")
     print(f"{'='*80}\n")
     
-    # Reset pruning time for this experiment
-    TOTAL_PRUNING_TIME = 0.0
-    
+    # Reset pruning time for this experiment    
     start_time = time.time()
     
     # Register UDF with current keep_ratio
@@ -265,7 +252,7 @@ def run_experiment(keep_ratio: float, dataset_name: str = "POPE_random") -> Tupl
     
     # Read POPE parquet
     POPE_PATH = "/scratch/hpc-prf-haqc/haikai/dataset/POPE/random-00000-of-00001.parquet"
-    pope_df = spark.read.parquet(POPE_PATH).limit(50)
+    pope_df = spark.read.parquet(POPE_PATH).limit(10)
     pope_df.createOrReplaceTempView("pope")
     print(f"Total records: {pope_df.count()}")
     
@@ -361,8 +348,8 @@ def calculate_accuracy(csv_path: str, keep_ratio: float) -> float:
 
 # Main execution
 if __name__ == "__main__":
-    keep_ratios = [1]
-    dataset_name = "POPE_llavanext"
+    keep_ratios = [0.056, 0.112, 0.224, 0.448, 0.56, 0.672, 0.784, 0.896, 1]
+    dataset_name = "trim_POPE_llavanext"
     
     overall_start = time.time()
     results = {}

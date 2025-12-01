@@ -2,9 +2,10 @@ import sys
 import os
 import time
 import pandas as pd
-from typing import Tuple, List, Dict, Any, Callable
+from typing import Tuple, List, Dict, Any
+import json
+import csv
 from util.utils import _generate_prompt
-
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import pandas_udf, col, when, lower, trim
 from pyspark.sql.types import StringType
@@ -13,8 +14,8 @@ from util.utils import *
 from util.cdencoder import *
 from util.cdpruner import *
 from util.trimTokenator import *
+from util.pruMerge import *
 from util.visual_util import *
-
 # Get the absolute path of the project root
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "./"))
 sys.path.insert(0, project_root)
@@ -41,87 +42,131 @@ spark = SparkSession.builder \
 API_URL = "http://localhost:8000/v1/chat/completions"
 RECOVERY_RATIO = 0.0
 
+# Global variable to track pruning time
+TOTAL_PRUNING_TIME = 0.0
+TIMING_CSV_FILE = None
+INVOCATION_COUNTER = 0
+
+def initialize_timing_csv(keep_ratio: float, dataset_name: str):
+    """Initialize CSV file for timing records."""
+    global TIMING_CSV_FILE, INVOCATION_COUNTER
+    
+    INVOCATION_COUNTER = 0
+    TIMING_CSV_FILE = f"./{dataset_name}_{keep_ratio}_timing.csv"
+    
+    # Create CSV with headers
+    with open(TIMING_CSV_FILE, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(['invocation_id', 'keep_ratio', 'preprocess_time', 'encode_time', 'prune_time', 'total_time'])
+    
+    print(f"Timing CSV initialized: {TIMING_CSV_FILE}")
+
+
+def record_timing(keep_ratio: float, preprocess_time: float, encode_time: float, prune_time: float):
+    """Record timing information to CSV file."""
+    global TIMING_CSV_FILE, INVOCATION_COUNTER
+    
+    if TIMING_CSV_FILE is None:
+        return
+    
+    INVOCATION_COUNTER += 1
+    total_time = preprocess_time + encode_time + prune_time
+    
+    with open(TIMING_CSV_FILE, 'a', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            INVOCATION_COUNTER,
+            keep_ratio,
+            f"{preprocess_time:.6f}",
+            f"{encode_time:.6f}",
+            f"{prune_time:.6f}",
+            f"{total_time:.6f}"
+        ])
+
+
 def execute_batch_pope_with_pruned_embeddings(
     modelname: str,
     fields: List[Dict[str, Any]],
     query: str,
     keep_ratio: float,
     typed_fields: List[Tuple[str, str]],
-    reordered_columns: List[str],  # NEW: List of columns in reordered sequence
+    reordered_columns: List[str],
     system_prompt: str = DEFAULT_SYSTEM_PROMPT,
     guided_choice: List[str] = None,
-    base_url: str = "http://localhost:8000/v1",
+    base_url: str = None, # Not used in offline mode, but kept for signature compatibility
 ) -> Tuple[List[str], float]:
-    """Returns tuple of (outputs, pruning_time)"""
+    
+    # --- PHASE 1: Pruning / Embedding Generation (PyTorch) ---
+    print("Phase 1: Loading Vision Model for Pruning...")
     tokenizer, model, processor = load_vision_models_llava_next(device='cuda')
+    
+    user_prompts = []
+    batch_pruning_time = 0.0
+    
+
+    # -----------------------------------------------------------------------
+    # 2. NOW IMPORT AND INITIALIZE VLLM
+    # -----------------------------------------------------------------------
+    # It is safe to import vllm now that the paths are set
+    final_results = []
     try:
-        # Build user prompts and generate pruned embeddings
-        user_prompts = []
-        all_pruned_embeddings = []
-        
         for field_dict in fields:
-            # Initialize prompt with empty string - we'll build it from scratch
             user_prompt = ""
             pruned_embeddings_for_this_prompt = []
             
-            # Build prompt following the REORDERED column sequence
             for field_name in reordered_columns:
-                # Find the field type for this field name
-                field_type = None
-                for fname, ftype in typed_fields:
-                    if fname == field_name:
-                        field_type = ftype
-                        break
+                # ... (Existing logic to find field type) ...
+                field_type = next((ft for fn, ft in typed_fields if fn == field_name), None)
                 
-                if field_type is None:
-                    continue  # Skip if field not found in typed_fields
                 if field_type == "text":
                     value = field_dict.get(field_name, "")
                     user_prompt += f"{field_name}: {value}\n"
                 
                 elif field_type == "image":
-                    user_prompt += f"{field_name}: [image]\n"
-                    image_data = field_dict.get(field_name)
+                    # IMPORTANT: vLLM needs the <image> token to know where to inject embeddings
+                    user_prompt += f"{field_name}: <image>\n" 
                     
+                    image_data = field_dict.get(field_name)
                     if image_data is not None:
                         image_binary = extract_image_binary_from_pope_data(image_data)
+                        #inputs = processor(text="<image>", images=Image.open(io.BytesIO(image_binary)), return_tensors="pt")
+                        
+                        #reduced_tokens = get_inputs_embeds(model, inputs, num_keep_tokens=128)
                         
                         reduced_tokens, _, _, _ = get_inputs_embeds_trim(model, processor, image_binary, keep_ratio=keep_ratio)
+                        full_prompt = _generate_prompt(user_prompt=user_prompt, system_prompt=system_prompt)
 
-                        all_pruned_embeddings.append(reduced_tokens.detach().cpu().to(torch.float16))
-            
-            user_prompts.append(user_prompt.strip())  # Remove trailing newline
+                        embed_tensor = [reduced_tokens[0].detach().cpu()]  # Changed this line
+                        
+                        response = post_http_request_with_embeds(
+                            modelname,
+                            [full_prompt],
+                            temperature=0,
+                            api_url=(base_url + "/chat/completions"),
+                            guided_choice=guided_choice,
+                            image_embeddings=[embed_tensor]
+                        )
+                        
+                        request_output = json.loads(response.content)
+                        choices = request_output.get('choices', [])
+                        
+                        if choices and 'message' in choices[0] and 'content' in choices[0]['message']:
+                            final_results.append(choices[0]['message']['content'])
+                        else:
+                            final_results.append(None)
 
-        # Generate full prompts
-        prompts = [_generate_prompt(user_prompt=user_prompt, system_prompt=system_prompt) 
-                   for user_prompt in user_prompts]
-        
-        outputs = []
-        if base_url:
-            # Send requests
-            for i, prompt in enumerate(prompts):    
-                response = post_http_request_with_embeds(
-                    modelname,
-                    [prompt],
-                    temperature=0,
-                    api_url=(base_url + "/chat/completions"),
-                    guided_choice=guided_choice,
-                    image_embeddings=[[all_pruned_embeddings[i]]]
-                )
-                
-                request_output = json.loads(response.content)
-                choices = request_output.get('choices', [])
-                
-                if choices and 'message' in choices[0] and 'content' in choices[0]['message']:
-                    outputs.append(choices[0]['message']['content'])
-                else:
-                    outputs.append(None)
-            
-            return outputs
-    
+            user_prompts.append(user_prompt.strip())
+            # Store only the first image embedding found (assuming 1 image per prompt based on your logic)
+            # all_pruned_embeddings.append(
+            #     pruned_embeddings_for_this_prompt if pruned_embeddings_for_this_prompt else None
+            # )
+
     finally:
+        # --- MEMORY MANAGEMENT ---
+        # We MUST destroy the PyTorch model to free up VRAM for vLLM
         torch.cuda.empty_cache()
 
+    return final_results, batch_pruning_time
 
 def create_llm_udf_with_embeddings(
     keep_ratio: float
@@ -131,6 +176,8 @@ def create_llm_udf_with_embeddings(
         prompts: pd.Series,
         *args: pd.Series
     ) -> pd.Series:      
+        global TOTAL_PRUNING_TIME
+        
         print(f"Batch size: {len(prompts)}")  
         prompt_template = prompts.iloc[0]
         typed_fields = parse_typed_fields(prompt_template)
@@ -161,17 +208,21 @@ def create_llm_udf_with_embeddings(
         # Convert to records for processing
         fields_list = merged_df.to_dict('records')
         
-        outputs = execute_batch_pope_with_pruned_embeddings(
+        outputs, batch_pruning_time = execute_batch_pope_with_pruned_embeddings(
             modelname="llava-hf/llava-v1.6-mistral-7b-hf",
             fields=fields_list,
             query=prompt_template,
             keep_ratio=keep_ratio,
             typed_fields=typed_fields,
-            reordered_columns=reordered_columns,  # Pass reordered column sequence
+            reordered_columns=reordered_columns,
             system_prompt=DEFAULT_SYSTEM_PROMPT,
             guided_choice=["Yes", "No"],
             base_url="http://localhost:8000/v1"
         )
+        
+        # Accumulate pruning time
+        TOTAL_PRUNING_TIME += batch_pruning_time
+        print(f"Batch pruning time: {batch_pruning_time:.2f}s, Total pruning time so far: {TOTAL_PRUNING_TIME:.2f}s")
         
         return pd.Series(outputs)
     
@@ -185,16 +236,18 @@ def extract_image_binary_from_pope_data(image_data):
     return image_data
 
 
-def run_experiment(keep_ratio: float, dataset_name: str = "POPE_random") -> Tuple[str, float]:
+def run_experiment(keep_ratio: float, dataset_name: str = "POPE_random") -> Tuple[str, float, float]:
     """Run experiment with specific keep_ratio and save results.
     Returns: (output_path, execution_time, pruning_time)
     """
+    initialize_timing_csv(keep_ratio, dataset_name)
     
     print(f"\n{'='*80}")
     print(f"Running experiment with keep_ratio={keep_ratio}")
     print(f"{'='*80}\n")
     
     # Reset pruning time for this experiment
+    TOTAL_PRUNING_TIME = 0.0
     
     start_time = time.time()
     
@@ -204,30 +257,32 @@ def run_experiment(keep_ratio: float, dataset_name: str = "POPE_random") -> Tupl
     
     # Read POPE parquet
     POPE_PATH = "/scratch/hpc-prf-haqc/haikai/dataset/POPE/random-00000-of-00001.parquet"
-    pope_df = spark.read.parquet(POPE_PATH).limit(10)
+    pope_df = spark.read.parquet(POPE_PATH).limit(20)
     pope_df.createOrReplaceTempView("pope")
     print(f"Total records: {pope_df.count()}")
     
     # Execute query with proper column references
-    result_df = spark.sql("""
+    result_df_with_comparison = spark.sql("""
         SELECT 
             id,
             question_id,
             question,
             answer,
             image_source,
-            LLM('Given the text: {text:question} and image: {image:image} give me the answer to the question', question, image) as predicted
+            LLM('Look at this image: {image:image}. return "Yes" if the image contains anything, otherwise "No"', image) as predicted
         FROM pope
     """)
     
+    #result_df_with_comparison = spark.sql("""SELECT id, question, image_source FROM pope WHERE LLM('Look at this image: {image:image}. return "Yes" if the image contains anything, otherwise "No"', image) = 'Yes'""")
+    
     # Normalize both answer and predicted columns for comparison
-    result_df_with_comparison = result_df.withColumn(
-        "is_correct",
-        when(
-            lower(trim(col("predicted"))) == lower(trim(col("answer"))),
-            1
-        ).otherwise(0)
-    ).drop("question")
+    # result_df_with_comparison = result_df.withColumn(
+    #     "is_correct",
+    #     when(
+    #         lower(trim(col("predicted"))) == lower(trim(col("answer"))),
+    #         1
+    #     ).otherwise(0)
+    # ).drop("question")
     
     # Write results to CSV
     output_path = f"./{dataset_name}_{keep_ratio}.csv"
@@ -235,8 +290,14 @@ def run_experiment(keep_ratio: float, dataset_name: str = "POPE_random") -> Tupl
     
     end_time = time.time()
     execution_time = end_time - start_time
+    pruning_time = 0
+    if TIMING_CSV_FILE and os.path.exists(TIMING_CSV_FILE):
+        timing_df = pd.read_csv(TIMING_CSV_FILE)
+        pruning_time = timing_df['total_time'].sum()
     
     print(f"\nExecution time for keep_ratio={keep_ratio}: {execution_time:.2f} seconds")
+    print(f"Pruning time for keep_ratio={keep_ratio}: {pruning_time:.2f} seconds")
+    print(f"Pruning percentage: {pruning_time/execution_time*100:.2f}%")
     
     # Write execution time to text file
     time_log_path = f"./{dataset_name}_{keep_ratio}_execution_time.txt"
@@ -246,15 +307,15 @@ def run_experiment(keep_ratio: float, dataset_name: str = "POPE_random") -> Tupl
         f.write(f"Dataset: {dataset_name}\n")
         f.write(f"Keep Ratio: {keep_ratio}\n")
         f.write(f"Total Execution Time: {execution_time:.2f} seconds ({execution_time/60:.2f} minutes)\n")
-        #f.write(f"Total Pruning Time: {pruning_time:.2f} seconds ({pruning_time/60:.2f} minutes)\n")
-        #f.write(f"Pruning Time Percentage: {pruning_time/execution_time*100:.2f}%\n")
+        f.write(f"Total Pruning Time: {pruning_time:.2f} seconds ({pruning_time/60:.2f} minutes)\n")
+        f.write(f"Pruning Time Percentage: {pruning_time/execution_time*100:.2f}%\n")
         f.write(f"Start Time: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(start_time))}\n")
         f.write(f"End Time: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(end_time))}\n")
         f.write(f"{'='*50}\n")
     
     print(f"Execution time logged to: {time_log_path}")
     
-    return output_path, execution_time
+    return output_path, execution_time, pruning_time
 
 def calculate_accuracy(csv_path: str, keep_ratio: float) -> float:
     """Read CSV and calculate accuracy."""
@@ -270,7 +331,11 @@ def calculate_accuracy(csv_path: str, keep_ratio: float) -> float:
         actual_csv = csv_path
     
     # Read CSV
-    df = pd.read_csv(actual_csv)
+    try:
+        df = pd.read_csv(actual_csv)
+    except FileNotFoundError:
+        print(f"Warning: CSV file not found at {actual_csv}")
+        return None
     
     # Calculate accuracy
     total = len(df)
@@ -290,8 +355,8 @@ def calculate_accuracy(csv_path: str, keep_ratio: float) -> float:
 
 # Main execution
 if __name__ == "__main__":
-    keep_ratios = [1, 0.056, 0.111, 0.222]
-    dataset_name = "POPE_trim_asyn"
+    keep_ratios = [0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1, 1]
+    dataset_name = "trim_agg_POPE_llavanext"
     
     overall_start = time.time()
     results = {}
@@ -299,14 +364,15 @@ if __name__ == "__main__":
     pruning_times = {}
     
     for keep_ratio in keep_ratios:
-        output_path, exec_time = run_experiment(
+        output_path, exec_time, prune_time = run_experiment(
             keep_ratio, 
             dataset_name
         )
         
         execution_times[keep_ratio] = exec_time
+        pruning_times[keep_ratio] = prune_time
         
-        accuracy = calculate_accuracy(output_path, keep_ratio)
+        accuracy = 0 #calculate_accuracy(output_path, keep_ratio)
         results[keep_ratio] = accuracy
     
     overall_end = time.time()
@@ -333,7 +399,7 @@ if __name__ == "__main__":
             accuracy = results.get(keep_ratio)
             exec_time = execution_times.get(keep_ratio, 0)
             prune_time = pruning_times.get(keep_ratio, 0)
-            prune_pct = (prune_time / exec_time * 100) if exec_time > 0 else 0
+            prune_pct = (prune_time / exec_time * 100) if exec_time > 0 else 0.0
             if accuracy is not None:
                 f.write(f"{keep_ratio:<12.3f} {accuracy:<12.2f}% {exec_time:<15.2f} {prune_time:<16.2f} {prune_pct:<10.2f}% {'✓':<10}\n")
             else:
@@ -356,7 +422,7 @@ if __name__ == "__main__":
         accuracy = results.get(keep_ratio)
         exec_time = execution_times.get(keep_ratio, 0)
         prune_time = pruning_times.get(keep_ratio, 0)
-        prune_pct = (prune_time / exec_time * 100) if exec_time > 0 else 0
+        prune_pct = (prune_time / exec_time * 100) if exec_time > 0 else 0.0
         if accuracy is not None:
             print(f"{keep_ratio:<12.3f} {accuracy:<12.2f}% {exec_time:<15.2f} {prune_time:<16.2f} {prune_pct:<10.2f}% {'✓':<10}")
         else:
@@ -364,4 +430,3 @@ if __name__ == "__main__":
     print(f"{'='*80}\n")
     
     spark.stop()
-

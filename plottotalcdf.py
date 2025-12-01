@@ -127,20 +127,18 @@ def create_cdf_plots(csv_files, redundancy_files, dataset_names, colors):
 
 # Usage
 if __name__ == "__main__":
-    # Define your CSV files
     csv_files = [
-        "/home/haikai/LLM-Multimodal/VQAv2.csv",
-        "/home/haikai/LLM-Multimodal/VQAtext.csv",
-        "/home/haikai/LLM-Multimodal/POPE.csv",
-        "/home/haikai/LLM-Multimodal/scivqa_token_counts.csv"
+        "/scratch/hpc-prf-haqc/haikai/LLM-Multimodal/VQAv2.csv",
+        "/scratch/hpc-prf-haqc/haikai/LLM-Multimodal/VQAtext.csv",
+        "/scratch/hpc-prf-haqc/haikai/LLM-Multimodal/POPE.csv",
+        "/scratch/hpc-prf-haqc/haikai/LLM-Multimodal/scivqa_token_counts.csv"
     ]
     
-    # Define redundancy CSV files
     redundancy_files = [
-        "/home/haikai/LLM-Multimodal/VQAv2_redundancy.csv",
-        "/home/haikai/LLM-Multimodal/VQAtext_redundancy.csv",
-        "/home/haikai/LLM-Multimodal/POPE_redundancy.csv",
-        "/home/haikai/LLM-Multimodal/scivqa_redundancy.csv"
+        "/scratch/hpc-prf-haqc/haikai/LLM-Multimodal/VQAv2_redundancy.csv",
+        "/scratch/hpc-prf-haqc/haikai/LLM-Multimodal/VQAtext_redundancy.csv",
+        "/scratch/hpc-prf-haqc/haikai/LLM-Multimodal/POPE_redundancy.csv",
+        #"/scratch/hpc-prf-haqc/haikai/LLM-Multimodal/scivqa_redundancy.csv"
     ]
     
     # Dataset names for legend
@@ -148,7 +146,7 @@ if __name__ == "__main__":
         "VQAv2",
         "VQAtext",
         "POPE",
-        "SciVQA"
+        #"SciVQA"
     ]
     
     # Colors for each dataset

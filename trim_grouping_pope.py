@@ -16,6 +16,7 @@ from util.utils import *
 from util.cdencoder import *
 from util.cdpruner import *
 from util.trimTokenator import *
+from util.visual_util import *
 
 # Get the absolute path of the project root
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "./"))
@@ -103,7 +104,7 @@ def preprocess_and_cache_pruned_embeddings(
 ) -> Tuple[Dict[str, Dict], float]: # CHANGED: Return type now includes float for total time
     # Load models once for all preprocessing
     print("Loading vision models...")
-    vision_tower, model, tokenizer = load_vision_models(device=device)
+    vision_tower, model, processor = load_vision_models_llava_next(device='cuda')
     
     try:
         # Group questions by image
@@ -144,28 +145,10 @@ def preprocess_and_cache_pruned_embeddings(
                 )
                 
                 time_start = time.time()
-                if keep_ratio == 1:
-                    # No pruning, use original tokens
-                    reduced_tokens, preprocess_time, encode_time  = getOriginalVisualToken(
-                                model,
-                                vision_tower,
-                                image_binary
-                    )
-                    # Record timing with zeros for no pruning
-                    record_timing(keep_ratio, preprocess_time, encode_time, 0.0)
-    
-                else:
-                    # Prune with combined guidance
-                    reduced_tokens, preprocess_time, encode_time, prune_time = trimTokenatorPruning(
-                                model,
-                                vision_tower,
-                                tokenizer,
-                                image_binary,
-                                combined_guidance,
-                                keep_ratio=keep_ratio
-                    )
-                    record_timing(keep_ratio, preprocess_time, encode_time, prune_time) 
-                
+
+                reduced_tokens, preprocess_time, encode_time, prune_time = get_inputs_embeds_trim(model, processor, image_binary, keep_ratio=keep_ratio)
+                record_timing(keep_ratio, preprocess_time, encode_time, prune_time) 
+            
                 time_end = time.time()
                 total_pruning_time += time_end - time_start
                 pruned_cache[image_id] = {
@@ -198,8 +181,7 @@ def preprocess_and_cache_pruned_embeddings(
     finally:
         # Clean up models
         print("\nCleaning up vision models...")
-        cleanup_vision_models(vision_tower, model)
-        print("Cleanup complete.")
+
 
 
 def inference_with_cached_embeddings(
@@ -254,6 +236,7 @@ def inference_with_cached_embeddings(
         async def fetch_all():
             tasks = []
             for i, prompt in enumerate(prompts):
+                
                 task = asyncio.to_thread(
                     post_http_request_with_embeds,
                     modelname,
@@ -261,7 +244,7 @@ def inference_with_cached_embeddings(
                     temperature=0,
                     api_url=(base_url + "/chat/completions"),
                     guided_choice=guided_choice,
-                    image_embeddings=[all_pruned_embeddings[i]] if all_pruned_embeddings[i] is not None else None
+                    image_embeddings=[all_pruned_embeddings[i].detach().cpu()]
                 )
                 tasks.append(task)
             
@@ -328,7 +311,7 @@ def create_llm_udf_with_cached_embeddings(embedding_cache: Dict[str, Dict], imag
         fields_list = merged_df.to_dict('records')
 
         outputs = inference_with_cached_embeddings(
-            modelname="llava-hf/llava-1.5-7b-hf",
+            modelname="llava-hf/llava-v1.6-mistral-7b-hf",
             fields=fields_list,
             query=prompt_template,
             typed_fields=typed_fields,
@@ -466,14 +449,14 @@ def calculate_accuracy(csv_path: str, keep_ratio: float) -> float:
 
 # Main execution
 if __name__ == "__main__":
-    keep_ratios = [1,0.9,0.8,0.7,0.6,0.5,0.4,0.3,0.2,0.1]
+    keep_ratios = [0.056, 0.112, 0.224, 0.448, 0.56, 0.672, 0.784, 0.896, 1]
     dataset_name = "POPE_trim_grouping"
     
     overall_start = time.time()
     
     # Read POPE parquet once
     POPE_PATH = "/scratch/hpc-prf-haqc/haikai/dataset/POPE/random-00000-of-00001.parquet"
-    pope_df = spark.read.parquet(POPE_PATH)
+    pope_df = spark.read.parquet(POPE_PATH).limit(100)
     pope_df.createOrReplaceTempView("pope")
     
     # Convert to pandas once

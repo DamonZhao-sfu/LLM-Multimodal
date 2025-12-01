@@ -16,6 +16,7 @@ from util.utils import *
 from util.cdencoder import *
 from util.cdpruner import *
 from util.trimTokenator import *
+from util.visual_util import *
 
 # Get the absolute path of the project root
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "./"))
@@ -97,7 +98,7 @@ def execute_batch_pope_with_pruned_embeddings(
 ) -> Tuple[List[str], float]:
     """Returns: (outputs, accumulated_pruning_time)"""
     #vision_tower, model, tokenizer = load_vision_models(device='cuda')
-    vision_tower, model, tokenizer = load_vision_models_llava_next(device='cuda')
+    vision_tower, model, processor = load_vision_models_llava_next(device='cuda')
     batch_pruning_time = 0.0  # Track pruning time for this batch
     
     try:
@@ -132,38 +133,21 @@ def execute_batch_pope_with_pruned_embeddings(
                     
                     if image_data is not None:
                         image_binary = extract_image_binary_from_pope_data(image_data)
-                        
-                        if keep_ratio == 1:
-                            reduced_tokens, preprocess_time, encode_time  = getOriginalVisualToken(
-                                model,
-                                vision_tower,
-                                image_binary
-                            )
-                            # Record timing with zeros for no pruning
-                            record_timing(keep_ratio, preprocess_time, encode_time, 0.0)
-           
-                        else:
-                            # Time the pruning operation
-                            reduced_tokens, preprocess_time, encode_time, prune_time = trimTokenatorPruning(
-                                model,
-                                vision_tower,
-                                tokenizer,
-                                image_binary,
-                                user_prompt,
-                                keep_ratio=keep_ratio
-                            )
-                            record_timing(keep_ratio, preprocess_time, encode_time, prune_time)    
-                        pruned_embeddings_for_this_prompt.append(reduced_tokens.to(torch.float16))
+                        inputs = processor(text="<image>", images=Image.open(io.BytesIO(image_binary)), return_tensors="pt")
+                        reduced_tokens = get_inputs_embeds(model, inputs, keep_ratio)
+                        #reduced_tokens, preprocess_time, encode_time, prune_time = get_inputs_embeds_trim(model, processor, image_binary, keep_ratio=keep_ratio)
+                        embed_tensor = [reduced_tokens[0].detach().cpu()]  # Changed this line                        
+                        #record_timing(keep_ratio, preprocess_time, encode_time, prune_time)    
+                        all_pruned_embeddings.append(embed_tensor)
             
             user_prompts.append(user_prompt.strip())  # Remove trailing newline
-            all_pruned_embeddings.append(
-                pruned_embeddings_for_this_prompt if pruned_embeddings_for_this_prompt else None
-            )
+          
         
         # Generate full prompts
         prompts = [_generate_prompt(user_prompt=user_prompt, system_prompt=system_prompt) 
                    for user_prompt in user_prompts]
-        
+        print("processing prompts num")
+        print(len(prompts))
         outputs = []
         if base_url:            
             async def fetch_all():
@@ -176,7 +160,7 @@ def execute_batch_pope_with_pruned_embeddings(
                         temperature=0,
                         api_url=(base_url + "/chat/completions"),
                         guided_choice=guided_choice,
-                        image_embeddings=[all_pruned_embeddings[i]] if all_pruned_embeddings[i] is not None else None
+                        image_embeddings=all_pruned_embeddings
                     )
                     tasks.append(task)
                 
@@ -254,7 +238,7 @@ def create_llm_udf_with_embeddings(
         fields_list = merged_df.to_dict('records')
         
         outputs, batch_pruning_time = execute_batch_pope_with_pruned_embeddings(
-            modelname="llava-hf/llava-1.5-7b-hf",
+            modelname="llava-hf/llava-v1.6-mistral-7b-hf",
             fields=fields_list,
             query=prompt_template,
             keep_ratio=keep_ratio,
@@ -421,7 +405,7 @@ if __name__ == "__main__":
     overall_end = time.time()
     overall_time = overall_end - overall_start
     total_pruning_time = sum(pruning_times.values())
-    
+    #2.75 3.79
     # Write summary to text file
     summary_path = f"./{dataset_name}_summary.txt"
     with open(summary_path, 'w') as f:

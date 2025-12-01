@@ -7,8 +7,9 @@ import torch
 from PIL import Image
 import io
 import csv
-import json
-
+import numpy as np
+np.bool = bool
+np.bool_ = bool
 from util.utils import _generate_prompt
 
 from pyspark.sql import SparkSession
@@ -100,6 +101,31 @@ def getTokenCount(model, vision_tower, tokenizer, image_binary, text):
     
     return N, M, total_pixels
 
+@torch.no_grad()
+def getTokenCountLLavaNext(model, processor, tokenizer, image_binary, text):
+    image = Image.open(io.BytesIO(image_binary))
+    model_device = model.get_input_embeddings().weight.device
+    inputs = processor(text="<image>", images=Image.open(io.BytesIO(image_binary)), return_tensors="pt")
+    input_ids = inputs.input_ids.to(model_device)
+    inputs_embeds = model.get_input_embeddings()(input_ids) 
+    
+    B, N, emb_dim = inputs_embeds.shape
+
+    text_inputs = tokenizer(
+            text=text, 
+            return_tensors="pt", 
+            padding=True
+            ).to(device=model_device)
+        
+    text_embeds = model.get_input_embeddings()(text_inputs.input_ids)
+    text_embeds = text_embeds.to(device=model_device, dtype=torch.float16)
+    M = text_embeds.shape[1]  # Number of text tokens
+    
+    width, height = image.size
+    total_pixels = width * height
+    
+    return N, M, total_pixels
+
 
 def convert_to_string(value):
     """Convert value to string, handling lists, arrays, and other types."""
@@ -132,7 +158,7 @@ def convert_to_string(value):
     # Handle other types
     return str(value)
 
-def process_json_file_with_spark(model, vision_tower, tokenizer, json_path, 
+def process_json_file_with_spark(model, processor, tokenizer, json_path, 
                                  image_column, text_columns, 
                                  image_base_path="/home/haikai/images_train/",
                                  output_csv="token_counts.csv",
@@ -191,7 +217,7 @@ def process_json_file_with_spark(model, vision_tower, tokenizer, json_path,
                 combined_text = text_separator.join(text_parts)
                 
                 # Get token counts and pixel count
-                N, M, total_pixels = getTokenCount(model, vision_tower, tokenizer, image_binary, combined_text)
+                N, M, total_pixels = getTokenCountLLavaNext(model, processor, tokenizer, image_binary, combined_text)
                 
                 # Write to CSV
                 writer.writerow([idx, N, M, N + M, total_pixels, width, height])
@@ -263,17 +289,17 @@ def process_parquet_file(model, vision_tower, tokenizer, parquet_path,
 
 
 # Load models once
-vision_tower, model, tokenizer = load_vision_models(device='cuda')
+tokenizer, model, processor = load_vision_models_llava_next(device='cuda')
 
 # ===== Example 1: Process JSON file with image paths (SciVQA format) =====
-JSON_PATH = "/home/haikai/train_2025-07-03_09-06.json"
+JSON_PATH = "/scratch/hpc-prf-haqc/haikai/dataset/scivqa/train_2025-07-03_09-06.json"
 IMAGE_COLUMN = "image_file"  # Column containing image file paths
 TEXT_COLUMNS = ["caption", "figure_type", "qa_pair_type", "question", "answer_options"]  # Adjust to your actual text columns
-IMAGE_BASE_PATH = "/home/haikai/images_train/"
+IMAGE_BASE_PATH = "/scratch/hpc-prf-haqc/haikai/dataset/scivqa/images_train/"
 
 process_json_file_with_spark(
     model=model,
-    vision_tower=vision_tower,
+    processor=processor,
     tokenizer=tokenizer,
     json_path=JSON_PATH,
     image_column=IMAGE_COLUMN,

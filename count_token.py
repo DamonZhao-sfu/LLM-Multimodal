@@ -12,7 +12,6 @@ import csv
 import json
 import asyncio
 import numpy as np
-
 from util.utils import _generate_prompt
 
 from pyspark.sql import SparkSession
@@ -133,19 +132,38 @@ def getTokenCount(model, vision_tower, tokenizer, image_binary, text):
     
     return N, M, total_pixels
 
-def process_parquet_file(model, vision_tower, tokenizer, parquet_path, 
+
+@torch.no_grad()
+def getTokenCountLLavaNext(model, processor, tokenizer, image_binary, text):
+    image = Image.open(io.BytesIO(image_binary))
+    model_device = model.get_input_embeddings().weight.device
+    inputs = processor(text="<image>", images=Image.open(io.BytesIO(image_binary)), return_tensors="pt")
+    input_ids = inputs.input_ids.to(model_device)
+    inputs_embeds = model.get_input_embeddings()(input_ids) 
+    
+    B, N, emb_dim = inputs_embeds.shape
+
+    text_inputs = tokenizer(
+            text=text, 
+            return_tensors="pt", 
+            padding=True
+            ).to(device=model_device)
+        
+    text_embeds = model.get_input_embeddings()(text_inputs.input_ids)
+    text_embeds = text_embeds.to(device=model_device, dtype=torch.float16)
+    M = text_embeds.shape[1]  # Number of text tokens
+    
+    width, height = image.size
+    total_pixels = width * height
+    
+    return N, M, total_pixels
+
+def process_parquet_file(model, processor, tokenizer, parquet_path, 
                         image_column, text_columns, 
                         image_id_column=None,
                         output_csv="token_counts.csv",
                         output_redundancy_csv=None,
                         text_separator=" "):
-    """
-    Process parquet file (for POPE/VQAv2/VQAtext format with embedded images).
-    
-    Args:
-        image_id_column: Column name to use for calculating image redundancy
-        output_redundancy_csv: CSV file to save image redundancy info (optional)
-    """
     # Read parquet file
     df = pd.read_parquet(parquet_path)
     
@@ -201,7 +219,7 @@ def process_parquet_file(model, vision_tower, tokenizer, parquet_path,
                 combined_text = text_separator.join(text_parts)
                 
                 # Get token counts and pixel count
-                N, M, total_pixels = getTokenCount(model, vision_tower, tokenizer, image_binary, combined_text)
+                N, M, total_pixels = getTokenCountLLavaNext(model, processor, tokenizer, image_binary, combined_text)
                 
                 # Write to CSV
                 writer.writerow([idx, N, M, N + M, total_pixels, width, height])
@@ -323,13 +341,13 @@ def process_json_file_with_spark(model, vision_tower, tokenizer, json_path,
     spark.stop()
 
 # Load models once
-vision_tower, model, tokenizer = load_vision_models(device='cuda')
+tokenizer, model, processor = load_vision_models_llava_next(device='cuda')
 
 # ===== Example 1: POPE Dataset =====
-# POPE_PATH = "/home/haikai/haikai/entropyTest/POPE.parquet"
+# POPE_PATH = "/scratch/hpc-prf-haqc/haikai/dataset/POPE/random-00000-of-00001.parquet"
 # process_parquet_file(
 #     model=model,
-#     vision_tower=vision_tower,
+#     processor=processor,
 #     tokenizer=tokenizer,
 #     parquet_path=POPE_PATH,
 #     image_column="image",
@@ -341,34 +359,34 @@ vision_tower, model, tokenizer = load_vision_models(device='cuda')
 # )
 
 # # ===== Example 2: VQAtext Dataset =====
-VQATEXT_PATH = "/home/haikai/LLM-Multimodal/VQAtext/validation-00000-of-00003.parquet"
-process_parquet_file(
-    model=model,
-    vision_tower=vision_tower,
-    tokenizer=tokenizer,
-    parquet_path=VQATEXT_PATH,
-    image_column="image",
-    text_columns="question",
-    image_id_column="image_id",  # VQAtext uses image_id
-    output_csv="VQAtext.csv",
-    output_redundancy_csv="VQAtext_redundancy.csv",
-    text_separator=" "
-)
-
-# ===== Example 3: VQAv2 Dataset =====
-# VQAV2_PATH = "/home/haikai/LLM-Multimodal/VQAv2/validation-00000-of-00068.parquet"
+# VQATEXT_PATH = "/scratch/hpc-prf-haqc/haikai/dataset/VQAText/validation-00000-of-00003.parquet"
 # process_parquet_file(
 #     model=model,
-#     vision_tower=vision_tower,
+#     processor=processor,
 #     tokenizer=tokenizer,
-#     parquet_path=VQAV2_PATH,
+#     parquet_path=VQATEXT_PATH,
 #     image_column="image",
 #     text_columns="question",
-#     image_id_column="image_id",  # VQAv2 uses image_id
-#     output_csv="VQAv2.csv",
-#     output_redundancy_csv="VQAv2_redundancy.csv",
+#     image_id_column="image_id",  # VQAtext uses image_id
+#     output_csv="VQAtext.csv",
+#     output_redundancy_csv="VQAtext_redundancy.csv",
 #     text_separator=" "
 # )
+
+# ===== Example 3: VQAv2 Dataset =====
+VQAV2_PATH = "/scratch/hpc-prf-haqc/haikai/dataset/VQAv2/validation-00000-of-00068.parquet"
+process_parquet_file(
+    model=model,
+    processor=processor,
+    tokenizer=tokenizer,
+    parquet_path=VQAV2_PATH,
+    image_column="image",
+    text_columns="question",
+    image_id_column="image_id",  # VQAv2 uses image_id
+    output_csv="VQAv2.csv",
+    output_redundancy_csv="VQAv2_redundancy.csv",
+    text_separator=" "
+)
 
 # # ===== Example 4: SciVQA Dataset =====
 # JSON_PATH = "/home/haikai/train_2025-07-03_09-06.json"
