@@ -174,7 +174,7 @@ def preprocess_and_cache_pruned_embeddings(
                 
                 # Cache the pruned embedding
                 pruned_cache[image_id] = {
-                    'embedding': reduced_tokens.detach().cpu().to(torch.float16),
+                    'embedding': reduced_tokens.to(torch.float16),
                     'prune_time': prune_time,
                     'original_tokens': 576,  # LLaVA default
                     'pruned_tokens': reduced_tokens.shape[1],
@@ -197,6 +197,7 @@ def preprocess_and_cache_pruned_embeddings(
     finally:
         # Clean up models
         print("\nCleaning up vision models...")
+        cleanup_vision_models(vision_tower, model)
         print("Cleanup complete.")
 
 

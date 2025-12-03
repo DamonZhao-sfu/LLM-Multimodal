@@ -148,19 +148,17 @@ def preprocess_and_cache_pruned_embeddings(
                     f"Extract the image's key information based on the below questions: "
                     f"{questions_text}"
                 )
-                # Prune image with combined guidance
-                #inputs = processor(text="<image>", images=Image.open(io.BytesIO(image_binary)), return_tensors="pt")
-                #reduced_tokens = get_inputs_embeds(model, inputs, keep_ratio)        
+                # Prune image with combined guidance       
                 reduced_tokens, preprocess_time, encode_time, prune_time = get_inputs_embeds_trim(model, processor, image_binary, keep_ratio=keep_ratio)
-                #record_timing(keep_ratio, preprocess_time, encode_time, prune_time)
+                record_timing(keep_ratio, preprocess_time, encode_time, prune_time)
 
                 total_pruning_time += prune_time
                 
                 # Cache the pruned embedding
                 pruned_cache[image_id] = {
-                    'embedding': reduced_tokens.to(torch.float16),
+                    'embedding': reduced_tokens.detach().cpu().to(torch.float16),
                     'prune_time': prune_time,
-                    'original_tokens': 576,  # LLaVA default
+                    'keep_ratio': keep_ratio,  # LLaVA default
                     'pruned_tokens': reduced_tokens.shape[1],
                     'num_questions': num_questions,
                     'guidance_length': len(combined_guidance)
@@ -175,14 +173,6 @@ def preprocess_and_cache_pruned_embeddings(
                 traceback.print_exc()
                 continue
         
-        # print("\n" + "=" * 80)
-        # print("PREPROCESSING COMPLETE")
-        # print("=" * 80)
-        # print(f"✅ Successfully pruned: {successful_prunes} images")
-        # print(f"❌ Failed to prune: {failed_prunes} images")
-        # print(f"⏱️  Total pruning time: {total_pruning_time:.2f}s")
-        # print(f"⏱️  Average time per image: {total_pruning_time / successful_prunes:.2f}s" if successful_prunes > 0 else "N/A")
-        # print("=" * 80)
         
         return pruned_cache, total_pruning_time
     
@@ -222,16 +212,32 @@ def inference_with_cached_embeddings(
             
             elif field_type == "image":
                 user_prompt = user_prompt.replace(placeholder, "[image]")
-                
-                # Retrieve cached embedding instead of processing image
                 if image_source and image_source in embedding_cache:
                     pruned_embedding = embedding_cache[image_source]['embedding']
+                    if not isinstance(pruned_embedding, torch.Tensor):
+                        pruned_embedding = torch.tensor(pruned_embedding)
+                    all_pruned_embeddings.append(pruned_embedding)
                 else:
-                    print(f"Warning: No cached embedding found for image_id: {image_source}")
-                    pruned_embedding = None
+                    all_pruned_embeddings.append(torch.zeros(1, 4096)) # Fallback empty
         
-        user_prompts.append(user_prompt)
-        all_pruned_embeddings.append(pruned_embedding)
+        user_prompts.append(user_prompt)    
+    
+    if embedding_cache[image_source]['keep_ratio'] != 1 and all_pruned_embeddings:
+        max_len = max(emb.shape[0] for emb in all_pruned_embeddings)
+        padded_embeddings = []
+        for emb in all_pruned_embeddings:
+            current_len = emb.shape[0]
+            if current_len < max_len:
+                # Pad the bottom with zeros: (pad_left, pad_right, pad_top, pad_bottom)
+                pad_amount = max_len - current_len
+                # F.pad format for 2D is (last_dim_left, last_dim_right, 2nd_last_left, 2nd_last_right)
+                # We want to pad dimension 0 (rows), so we pad the 2nd to last dimension.
+                padded_emb = F.pad(emb, (0, 0, 0, pad_amount), "constant", 0)
+                padded_embeddings.append(padded_emb)
+            else:
+                padded_embeddings.append(emb)
+        
+        all_pruned_embeddings = padded_embeddings
     
     # Generate full prompts
     prompts = [
@@ -351,15 +357,10 @@ def run_experiment_with_cached_embeddings(
     """Run experiment with cached embeddings for a specific keep_ratio.
     Returns: (output_path, execution_time, pruning_time)
     """
-    print(f"\n{'='*80}")
-    print(f"Running experiment with keep_ratio={keep_ratio}")
-    print(f"{'='*80}\n")
     initialize_timing_csv(keep_ratio, dataset_name)
-
     start_time = time.time()
     
     # Preprocess and cache pruned embeddings
-    print(f"Preprocessing images with keep_ratio={keep_ratio}...")
     embedding_cache, pruning_time = preprocess_and_cache_pruned_embeddings(
         df=pope_pandas_df,
         image_column='image',
@@ -479,7 +480,8 @@ def calculate_accuracy(csv_path: str, keep_ratio: float) -> float:
 
 # Main execution
 if __name__ == "__main__":
-    keep_ratios = [0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1, 1]
+    #keep_ratios = [0.056, 0.112, 0.224, 0.448, 0.56, 0.672, 0.784, 0.896, 1]
+    keep_ratios = [1]
     dataset_name = "textvqa_trim_grouping_llava16"
     
     overall_start = time.time()

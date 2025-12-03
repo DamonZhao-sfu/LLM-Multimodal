@@ -13,8 +13,6 @@ from pyspark.sql.functions import pandas_udf, col, when, lower, trim
 from pyspark.sql.types import StringType
 from util.mllm import *
 from util.utils import *
-from util.cdencoder import *
-from util.cdpruner import *
 from util.trimTokenator import *
 from util.visual_util import *
 
@@ -152,7 +150,7 @@ def preprocess_and_cache_pruned_embeddings(
                 time_end = time.time()
                 total_pruning_time += time_end - time_start
                 pruned_cache[image_id] = {
-                    'embedding': reduced_tokens.to(torch.float16),
+                    'embedding': reduced_tokens.detach().cpu().to(torch.float16),
                     'original_tokens': 576,  # LLaVA default
                     'pruned_tokens': reduced_tokens.shape[1],
                     'num_questions': num_questions,
@@ -198,45 +196,59 @@ def inference_with_cached_embeddings(
     user_prompts = []
     all_pruned_embeddings = []
     
-    # Build prompts and retrieve cached embeddings
     for idx, field_dict in enumerate(fields):
         user_prompt = query
         pruned_embedding = None
-        
         image_source = image_source_mapping.get(idx)
         
         for field_name, field_type in typed_fields:
             placeholder = f"{{{field_type}:{field_name}}}"
-            
             if field_type == "text":
                 value = field_dict.get(field_name, "")
                 user_prompt = user_prompt.replace(placeholder, str(value))
-            
             elif field_type == "image":
                 user_prompt = user_prompt.replace(placeholder, "[image]")
-                
-                # Retrieve cached embedding instead of processing image
                 if image_source and image_source in embedding_cache:
+                    # Ensure it is a Tensor and on CPU
                     pruned_embedding = embedding_cache[image_source]['embedding']
+                    if not isinstance(pruned_embedding, torch.Tensor):
+                        pruned_embedding = torch.tensor(pruned_embedding)
+                    all_pruned_embeddings.append(pruned_embedding)
                 else:
-                    print(f"Warning: No cached embedding found for image_id: {image_source}")
-                    pruned_embedding = None
+                    all_pruned_embeddings.append(torch.zeros(1, 4096)) # Fallback empty
         
         user_prompts.append(user_prompt)
-        all_pruned_embeddings.append(pruned_embedding)
-    
+
+    # --- FIX START: PAD EMBEDDINGS ---
+    # if all_pruned_embeddings:
+    #     max_len = max(emb.shape[0] for emb in all_pruned_embeddings)
+    #     padded_embeddings = []
+    #     for emb in all_pruned_embeddings:
+    #         current_len = emb.shape[0]
+    #         if current_len < max_len:
+    #             # Pad the bottom with zeros: (pad_left, pad_right, pad_top, pad_bottom)
+    #             pad_amount = max_len - current_len
+    #             # F.pad format for 2D is (last_dim_left, last_dim_right, 2nd_last_left, 2nd_last_right)
+    #             # We want to pad dimension 0 (rows), so we pad the 2nd to last dimension.
+    #             padded_emb = F.pad(emb, (0, 0, 0, pad_amount), "constant", 0)
+    #             padded_embeddings.append(padded_emb)
+    #         else:
+    #             padded_embeddings.append(emb)
+        
+    #     # Replace the original list with the padded list
+    #     all_pruned_embeddings = padded_embeddings
+
     # Generate full prompts
     prompts = [
         _generate_prompt(user_prompt=user_prompt, system_prompt=system_prompt)
         for user_prompt in user_prompts
     ]
-    
+
     outputs = []
     if base_url:            
         async def fetch_all():
             tasks = []
             for i, prompt in enumerate(prompts):
-                
                 task = asyncio.to_thread(
                     post_http_request_with_embeds,
                     modelname,
@@ -244,7 +256,7 @@ def inference_with_cached_embeddings(
                     temperature=0,
                     api_url=(base_url + "/chat/completions"),
                     guided_choice=guided_choice,
-                    image_embeddings=[all_pruned_embeddings[i].detach().cpu()]
+                    image_embeddings=[[all_pruned_embeddings[i]]]
                 )
                 tasks.append(task)
             
@@ -272,8 +284,6 @@ def inference_with_cached_embeddings(
                     
             return processed_outputs
 
-        # Run the async main function from our synchronous context
-        # This will block until all concurrent requests are complete
         outputs = asyncio.run(fetch_all())            
         return outputs
 
@@ -333,9 +343,6 @@ def run_experiment_with_cached_embeddings(
     dataset_name: str = "POPE_image_prefix"
 ) -> Tuple[str, float, float]: # CHANGED: Return type now includes total_pruning_time
     """Run experiment with cached embeddings for a specific keep_ratio."""
-    print(f"\n{'='*80}")
-    print(f"Running experiment with keep_ratio={keep_ratio}")
-    print(f"{'='*80}\n")
     initialize_timing_csv(keep_ratio, dataset_name)
 
     start_time = time.time()
@@ -392,9 +399,14 @@ def run_experiment_with_cached_embeddings(
     
     end_time = time.time()
     execution_time = end_time - start_time
+    pruning_time = 0
+    if TIMING_CSV_FILE and os.path.exists(TIMING_CSV_FILE):
+        timing_df = pd.read_csv(TIMING_CSV_FILE)
+        pruning_time = timing_df['total_time'].sum()
     
     print(f"\nExecution time for keep_ratio={keep_ratio}: {execution_time:.2f} seconds")
-    print(f"Preprocessing (Pruning) time for keep_ratio={keep_ratio}: {total_pruning_time:.2f} seconds")
+    print(f"Pruning time for keep_ratio={keep_ratio}: {pruning_time:.2f} seconds")
+    print(f"Pruning percentage: {pruning_time/execution_time*100:.2f}%")
     
     # Write execution time to text file
     time_log_path = f"./{dataset_name}_{keep_ratio}_execution_time.txt"
@@ -449,14 +461,16 @@ def calculate_accuracy(csv_path: str, keep_ratio: float) -> float:
 
 # Main execution
 if __name__ == "__main__":
-    keep_ratios = [0.056, 0.112, 0.224, 0.448, 0.56, 0.672, 0.784, 0.896, 1]
-    dataset_name = "POPE_trim_grouping"
+    #keep_ratios = [0.056, 0.112, 0.224, 0.448, 0.56, 0.672, 0.784, 0.896, 1]
+    keep_ratios = [1]
+
+    dataset_name = "POPE_trim_grouping_llava16"
     
     overall_start = time.time()
     
     # Read POPE parquet once
     POPE_PATH = "/scratch/hpc-prf-haqc/haikai/dataset/POPE/random-00000-of-00001.parquet"
-    pope_df = spark.read.parquet(POPE_PATH).limit(100)
+    pope_df = spark.read.parquet(POPE_PATH)
     pope_df.createOrReplaceTempView("pope")
     
     # Convert to pandas once
@@ -500,6 +514,10 @@ if __name__ == "__main__":
         f.write(f"{'='*80}\n")
         f.write(f"Dataset: {dataset_name}\n")
         f.write(f"Total Overall Execution Time: {overall_time:.2f} seconds ({overall_time/60:.2f} minutes)\n")
+        
+        f.write(f"Total Accumulated Pruning Time: {total_pruning_time:.2f} seconds ({total_pruning_time/60:.2f} minutes)\n")
+        f.write(f"Pruning Time Percentage: {total_pruning_time/overall_time*100:.2f}%\n")
+        
         f.write(f"Start Time: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(overall_start))}\n")
         f.write(f"End Time: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(overall_end))}\n")
         f.write(f"\n{'='*80}\n")
@@ -528,7 +546,6 @@ if __name__ == "__main__":
     print(f"{'='*80}")
     print(f"Dataset: {dataset_name}")
     print(f"Total execution time: {overall_time:.2f} seconds ({overall_time/60:.2f} minutes)\n")
-    # CHANGED: Added 'Prep Time (s)' to the console header
     print(f"{'Keep Ratio':<15} {'Accuracy':<15} {'Total Time (s)':<20} {'Prep Time (s)':<20} {'Status':<15}")
     print(f"{'-'*85}")
     for keep_ratio in keep_ratios:
@@ -536,10 +553,8 @@ if __name__ == "__main__":
         exec_time = execution_times.get(keep_ratio, 0)
         prep_time = pruning_times.get(keep_ratio, 0) # ADDED
         if accuracy is not None:
-            # CHANGED: Added prep_time to the console output
             print(f"{keep_ratio:<15.3f} {accuracy:<15.2f}% {exec_time:<20.2f} {prep_time:<20.2f} {'✓':<15}")
         else:
-            # CHANGED: Added prep_time to the console output
             print(f"{keep_ratio:<15.3f} {'N/A':<15} {exec_time:<20.2f} {prep_time:<20.2f} {'✗':<15}")
     print(f"{'='*80}\n")
     

@@ -2,20 +2,19 @@ import sys
 import os
 import time
 import pandas as pd
-import torch
-import asyncio
+from typing import Tuple, List, Dict, Any, Callable
 import json
+import asyncio
 import csv
-from typing import Dict, List, Tuple, Any
+from util.utils import _generate_prompt
+
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import regexp_replace, col, when, lower, trim
 from pyspark.sql.functions import pandas_udf, col, when, lower, trim
 from pyspark.sql.types import StringType
 from util.mllm import *
 from util.utils import *
-from util.cdencoder import *
-from util.utils import _generate_prompt
 from util.trimTokenator import *
+from util.visual_util import *
 
 # Get the absolute path of the project root
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "./"))
@@ -42,6 +41,10 @@ spark = SparkSession.builder \
 # Global variables for model configuration
 API_URL = "http://localhost:8000/v1/chat/completions"
 RECOVERY_RATIO = 0.0
+
+TOTAL_PRUNING_TIME = 0.0
+TIMING_CSV_FILE = None
+INVOCATION_COUNTER = 0
 
 def initialize_timing_csv(keep_ratio: float, dataset_name: str):
     """Initialize CSV file for timing records."""
@@ -88,27 +91,24 @@ def extract_image_binary_from_pope_data(image_data):
         return image_data[0] if len(image_data) > 0 else image_data
     return image_data
 
+
 def preprocess_and_cache_pruned_embeddings(
     df: pd.DataFrame,
     image_column: str,
     question_column: str,
     image_id_column: str,
     keep_ratio: float,
-    device: str = 'cuda:0'
-) -> Tuple[Dict[str, Dict], float]:
-    """Returns pruned cache and total pruning time."""
+    device: str = 'cuda'
+) -> Tuple[Dict[str, Dict], float]: # CHANGED: Return type now includes float for total time
     # Load models once for all preprocessing
     print("Loading vision models...")
-    vision_tower, model, tokenizer = load_vision_models(device=device)
+    vision_tower, model, processor = load_vision_models_llava_next(device='cuda')
     
     try:
         # Group questions by image
-        print(f"\nGrouping questions by {image_id_column}...")
         image_groups = df.groupby(image_id_column)
         unique_images = len(image_groups)
         
-        print(f"Found {unique_images} unique images")
-        print(f"Total questions in dataset: {len(df)}")
         
         # Display image distribution
         image_counts = df.groupby(image_id_column).size().sort_values(ascending=False)
@@ -119,14 +119,13 @@ def preprocess_and_cache_pruned_embeddings(
         print("\n" + "-" * 80)
         
         pruned_cache = {}
-        total_pruning_time = 0
+        total_pruning_time = 0 # This tracks only the actual pruning time
         successful_prunes = 0
         failed_prunes = 0
         
         # Process each unique image
         for image_idx, (image_id, image_group) in enumerate(image_groups):
             num_questions = len(image_group)
-            
             try:
                 # Get image data (same for all rows with this image_id)
                 image_data = image_group.iloc[0][image_column]
@@ -143,39 +142,15 @@ def preprocess_and_cache_pruned_embeddings(
                     f"{questions_text}"
                 )
                 
-                prune_start = time.time()
-                
-                if keep_ratio == 1:
-                    # No pruning, use original tokens
-                    reduced_tokens, preprocess_time, encode_time  = getOriginalVisualToken(
-                                model,
-                                vision_tower,
-                                image_binary
-                    )
-                    # Record timing with zeros for no pruning
-                    record_timing(keep_ratio, preprocess_time, encode_time, 0.0)
-    
-                else:
-                    # Prune with combined guidance
-                    reduced_tokens, preprocess_time, encode_time, prune_time = trimTokenatorPruning(
-                                model,
-                                vision_tower,
-                                tokenizer,
-                                image_binary,
-                                combined_guidance,
-                                keep_ratio=keep_ratio
-                    )
-                    record_timing(keep_ratio, preprocess_time, encode_time, prune_time) 
-                
-                
-                prune_end = time.time()
-                prune_time = prune_end - prune_start
-                total_pruning_time += prune_time
-                
-                # Cache the pruned embedding
+                time_start = time.time()
+
+                reduced_tokens, preprocess_time, encode_time, prune_time = get_inputs_embeds_trim(model, processor, image_binary, keep_ratio=keep_ratio)
+                record_timing(keep_ratio, preprocess_time, encode_time, prune_time) 
+            
+                time_end = time.time()
+                total_pruning_time += time_end - time_start
                 pruned_cache[image_id] = {
                     'embedding': reduced_tokens.detach().cpu().to(torch.float16),
-                    'prune_time': prune_time,
                     'original_tokens': 576,  # LLaVA default
                     'pruned_tokens': reduced_tokens.shape[1],
                     'num_questions': num_questions,
@@ -191,13 +166,20 @@ def preprocess_and_cache_pruned_embeddings(
                 traceback.print_exc()
                 continue
         
+        print("\n" + "=" * 80)
+        print("PREPROCESSING COMPLETE")
+        print("=" * 80)
+        print(f"✅ Successfully pruned: {successful_prunes} images")
+        print(f"❌ Failed to prune: {failed_prunes} images")
+        print(f"⏱️  Total pruning time (Sum of individual prune times): {total_pruning_time:.2f}s") 
+        print("=" * 80)
         
         return pruned_cache, total_pruning_time
     
     finally:
         # Clean up models
         print("\nCleaning up vision models...")
-        print("Cleanup complete.")
+
 
 
 def inference_with_cached_embeddings(
@@ -214,81 +196,97 @@ def inference_with_cached_embeddings(
     user_prompts = []
     all_pruned_embeddings = []
     
-    # Build prompts and retrieve cached embeddings
     for idx, field_dict in enumerate(fields):
         user_prompt = query
         pruned_embedding = None
-        
         image_source = image_source_mapping.get(idx)
         
         for field_name, field_type in typed_fields:
             placeholder = f"{{{field_type}:{field_name}}}"
-            
             if field_type == "text":
                 value = field_dict.get(field_name, "")
                 user_prompt = user_prompt.replace(placeholder, str(value))
-            
             elif field_type == "image":
                 user_prompt = user_prompt.replace(placeholder, "[image]")
-                
-                # Retrieve cached embedding instead of processing image
                 if image_source and image_source in embedding_cache:
+                    # Ensure it is a Tensor and on CPU
                     pruned_embedding = embedding_cache[image_source]['embedding']
+                    if not isinstance(pruned_embedding, torch.Tensor):
+                        pruned_embedding = torch.tensor(pruned_embedding)
+                    all_pruned_embeddings.append(pruned_embedding)
                 else:
-                    print(f"Warning: No cached embedding found for image_id: {image_source}")
-                    pruned_embedding = None
+                    all_pruned_embeddings.append(torch.zeros(1, 4096)) # Fallback empty
         
         user_prompts.append(user_prompt)
-        all_pruned_embeddings.append(pruned_embedding)
-    
+
+    # --- FIX START: PAD EMBEDDINGS ---
+    # if all_pruned_embeddings:
+    #     max_len = max(emb.shape[0] for emb in all_pruned_embeddings)
+    #     padded_embeddings = []
+    #     for emb in all_pruned_embeddings:
+    #         current_len = emb.shape[0]
+    #         if current_len < max_len:
+    #             # Pad the bottom with zeros: (pad_left, pad_right, pad_top, pad_bottom)
+    #             pad_amount = max_len - current_len
+    #             # F.pad format for 2D is (last_dim_left, last_dim_right, 2nd_last_left, 2nd_last_right)
+    #             # We want to pad dimension 0 (rows), so we pad the 2nd to last dimension.
+    #             padded_emb = F.pad(emb, (0, 0, 0, pad_amount), "constant", 0)
+    #             padded_embeddings.append(padded_emb)
+    #         else:
+    #             padded_embeddings.append(emb)
+        
+    #     # Replace the original list with the padded list
+    #     all_pruned_embeddings = padded_embeddings
+
     # Generate full prompts
     prompts = [
         _generate_prompt(user_prompt=user_prompt, system_prompt=system_prompt)
         for user_prompt in user_prompts
     ]
-    
-    # Send requests to API
-    outputs = []
-    
-    async def fetch_all():
-        tasks = []
-        for i, prompt in enumerate(prompts):
-            task = asyncio.to_thread(
-                post_http_request_with_embeds,
-                modelname,
-                [prompt],
-                temperature=0,
-                api_url=(base_url + "/chat/completions"),
-                guided_choice=guided_choice,
-                image_embeddings=[all_pruned_embeddings[i]] if all_pruned_embeddings[i] is not None else None
-            )
-            tasks.append(task)
-        
-        # Gather all responses concurrently
-        responses = await asyncio.gather(*tasks)
-        
-        # Process responses in order
-        processed_outputs = []
-        for response in responses:
-            try:
-                # Assuming response has a .content attribute like a requests.Response
-                request_output = json.loads(response.content) 
-                choices = request_output.get('choices', [])
-                
-                if choices and 'message' in choices[0] and 'content' in choices[0]['message']:
-                    processed_outputs.append(choices[0]['message']['content'])
-                else:
-                    # Log error or empty response
-                    print(f"Warning: No valid content in response. Output: {request_output}")
-                    processed_outputs.append(None)
-            except Exception as e:
-                # Log exception
-                print(f"Error processing response: {e}. Response content: {getattr(response, 'content', 'N/A')}")
-                processed_outputs.append(None)
-                
-        return processed_outputs
 
-    outputs = asyncio.run(fetch_all())    
+    outputs = []
+    if base_url:            
+        async def fetch_all():
+            tasks = []
+            for i, prompt in enumerate(prompts):
+                task = asyncio.to_thread(
+                    post_http_request_with_embeds,
+                    modelname,
+                    [prompt],
+                    temperature=0,
+                    api_url=(base_url + "/chat/completions"),
+                    guided_choice=guided_choice,
+                    image_embeddings=[[all_pruned_embeddings[i]]]
+                )
+                tasks.append(task)
+            
+            # Gather all responses concurrently
+            responses = await asyncio.gather(*tasks)
+            
+            # Process responses in order
+            processed_outputs = []
+            for response in responses:
+                try:
+                    # Assuming response has a .content attribute like a requests.Response
+                    request_output = json.loads(response.content) 
+                    choices = request_output.get('choices', [])
+                    
+                    if choices and 'message' in choices[0] and 'content' in choices[0]['message']:
+                        processed_outputs.append(choices[0]['message']['content'])
+                    else:
+                        # Log error or empty response
+                        print(f"Warning: No valid content in response. Output: {request_output}")
+                        processed_outputs.append(None)
+                except Exception as e:
+                    # Log exception
+                    print(f"Error processing response: {e}. Response content: {getattr(response, 'content', 'N/A')}")
+                    processed_outputs.append(None)
+                    
+            return processed_outputs
+
+        outputs = asyncio.run(fetch_all())            
+        return outputs
+
     return outputs
 
 
@@ -298,8 +296,11 @@ def create_llm_udf_with_cached_embeddings(embedding_cache: Dict[str, Dict], imag
         prompts: pd.Series,
         *args: pd.Series
     ) -> pd.Series:
-        prompt_template = prompts.iloc[0]        
+        prompt_template = prompts.iloc[0]
+        print(f"Processing batch on PID {os.getpid()} with cached embeddings")
+        
         typed_fields = parse_typed_fields(prompt_template)
+        
         if len(args) != len(typed_fields):
             raise ValueError(
                 f"Expected {len(typed_fields)} column(s) for fields {[f[0] for f in typed_fields]}, "
@@ -320,13 +321,14 @@ def create_llm_udf_with_cached_embeddings(embedding_cache: Dict[str, Dict], imag
         fields_list = merged_df.to_dict('records')
 
         outputs = inference_with_cached_embeddings(
-            modelname="llava-hf/llava-1.5-7b-hf",
+            modelname="llava-hf/llava-v1.6-mistral-7b-hf",
             fields=fields_list,
             query=prompt_template,
             typed_fields=typed_fields,
             embedding_cache=embedding_cache,
             image_source_mapping=image_source_mapping,
             system_prompt=DEFAULT_SYSTEM_PROMPT,
+            guided_choice=["Yes", "No"],
             base_url="http://localhost:8000/v1"
         )
         
@@ -339,30 +341,30 @@ def run_experiment_with_cached_embeddings(
     pope_pandas_df: pd.DataFrame,
     pope_spark_df,
     dataset_name: str = "POPE_image_prefix"
-) -> Tuple[str, float, float]:
-    """Run experiment with cached embeddings for a specific keep_ratio.
-    Returns: (output_path, execution_time, pruning_time)
-    """
+) -> Tuple[str, float, float]: # CHANGED: Return type now includes total_pruning_time
+    """Run experiment with cached embeddings for a specific keep_ratio."""
     print(f"\n{'='*80}")
     print(f"Running experiment with keep_ratio={keep_ratio}")
     print(f"{'='*80}\n")
     initialize_timing_csv(keep_ratio, dataset_name)
+
     start_time = time.time()
     
     # Preprocess and cache pruned embeddings
     print(f"Preprocessing images with keep_ratio={keep_ratio}...")
-    embedding_cache, pruning_time = preprocess_and_cache_pruned_embeddings(
+    # CHANGED: Capture both the cache and the total pruning time
+    embedding_cache, total_pruning_time = preprocess_and_cache_pruned_embeddings(
         df=pope_pandas_df,
         image_column='image',
         question_column='question',
-        image_id_column='image_id',
+        image_id_column='image_source',
         keep_ratio=keep_ratio,
-        device='cuda:0'
+        device='cuda'
     )
     
     # Create image source mapping
     image_source_mapping_reordered = {
-        idx: row['image_id'] 
+        idx: row['image_source'] 
         for idx, row in pope_pandas_df.iterrows()
     }
     
@@ -376,29 +378,38 @@ def run_experiment_with_cached_embeddings(
     # Execute query
     result_df = spark.sql("""
         SELECT 
-            multiple_choice_answer,
-            LLM('Given the question: {text:question} and candidate answers {text:answers} and {text:answer_type} and image: {image:image}, give me the answer to the question', question, answers, answer_type, image) as predicted
+            id,
+            question_id,
+            question,
+            answer,
+            image_source,
+            LLM('Given the question: {text:question} and image: {image:image}, give me the answer to the question', question, image) as predicted
         FROM pope
     """)
     
+    # Add comparison column
     result_df_with_comparison = result_df.withColumn(
-    "is_correct",
-    when(
-        lower(col("predicted")).contains(lower(trim(col("multiple_choice_answer")))),
-        1
-    ).otherwise(0)).drop("predicted")
+        "is_correct",
+        when(
+            lower(trim(col("predicted"))) == lower(trim(col("answer"))),
+            1
+        ).otherwise(0)
+    ).drop("question")
     
-    # Write results to CSV with semicolon separator
+    # Write results to CSV
     output_path = f"./{dataset_name}_{keep_ratio}.csv"
-    result_df_with_comparison.coalesce(1).write.mode("overwrite") \
-        .option("header", "true") \
-        .option("sep", ";") \
-        .csv(output_path)
+    result_df_with_comparison.coalesce(1).write.mode("overwrite").option("header", "true").csv(output_path)
     
     end_time = time.time()
     execution_time = end_time - start_time
+    pruning_time = 0
+    if TIMING_CSV_FILE and os.path.exists(TIMING_CSV_FILE):
+        timing_df = pd.read_csv(TIMING_CSV_FILE)
+        pruning_time = timing_df['total_time'].sum()
+    
     print(f"\nExecution time for keep_ratio={keep_ratio}: {execution_time:.2f} seconds")
     print(f"Pruning time for keep_ratio={keep_ratio}: {pruning_time:.2f} seconds")
+    print(f"Pruning percentage: {pruning_time/execution_time*100:.2f}%")
     
     # Write execution time to text file
     time_log_path = f"./{dataset_name}_{keep_ratio}_execution_time.txt"
@@ -407,20 +418,20 @@ def run_experiment_with_cached_embeddings(
         f.write(f"{'='*50}\n")
         f.write(f"Dataset: {dataset_name}\n")
         f.write(f"Keep Ratio: {keep_ratio}\n")
-        f.write(f"Total Execution Time: {execution_time:.2f} seconds ({execution_time/60:.2f} minutes)\n")
-        f.write(f"Pruning Time: {pruning_time:.2f} seconds ({pruning_time/60:.2f} minutes)\n")
-        f.write(f"Inference Time: {(execution_time - pruning_time):.2f} seconds ({(execution_time - pruning_time)/60:.2f} minutes)\n")
+        f.write(f"Total Execution Time (Prep + Inference): {execution_time:.2f} seconds ({execution_time/60:.2f} minutes)\n")
+        f.write(f"Preprocessing (Pruning) Time: {total_pruning_time:.2f} seconds\n") # ADDED
         f.write(f"Start Time: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(start_time))}\n")
         f.write(f"End Time: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(end_time))}\n")
         f.write(f"{'='*50}\n")
     
     print(f"Execution time logged to: {time_log_path}")
     
-    return output_path, execution_time, pruning_time
+    # CHANGED: Return the total pruning time as well
+    return output_path, execution_time, total_pruning_time
 
 
 def calculate_accuracy(csv_path: str, keep_ratio: float) -> float:
-    """Read CSV with semicolon separator and calculate accuracy."""
+    """Read CSV and calculate accuracy."""
     # Find the actual CSV file in the directory (Spark creates a folder)
     if os.path.isdir(csv_path):
         csv_files = [f for f in os.listdir(csv_path) if f.endswith('.csv') and not f.startswith('.')]
@@ -432,8 +443,8 @@ def calculate_accuracy(csv_path: str, keep_ratio: float) -> float:
     else:
         actual_csv = csv_path
     
-    # Read CSV with semicolon separator
-    df = pd.read_csv(actual_csv, sep=';')
+    # Read CSV
+    df = pd.read_csv(actual_csv)
     
     # Calculate accuracy
     total = len(df)
@@ -453,13 +464,15 @@ def calculate_accuracy(csv_path: str, keep_ratio: float) -> float:
 
 # Main execution
 if __name__ == "__main__":
-    keep_ratios = [1, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1]
-    dataset_name = "vqa_trim_grouping"
+    #keep_ratios = [0.056, 0.112, 0.224, 0.448, 0.56, 0.672, 0.784, 0.896, 1]
+    keep_ratios = [1]
+
+    dataset_name = "POPE_trim_grouping_llava16"
     
     overall_start = time.time()
     
     # Read POPE parquet once
-    POPE_PATH = "/scratch/hpc-prf-haqc/haikai/dataset/VQAv2/validation-00000-of-00068.parquet"
+    POPE_PATH = "/scratch/hpc-prf-haqc/haikai/dataset/POPE/random-00000-of-00001.parquet"
     pope_df = spark.read.parquet(POPE_PATH)
     pope_df.createOrReplaceTempView("pope")
     
@@ -472,6 +485,8 @@ if __name__ == "__main__":
     
     # Run experiments for each keep_ratio
     for keep_ratio in keep_ratios:
+
+        # CHANGED: Capture the new total_pruning_time return value
         output_path, exec_time, prune_time = run_experiment_with_cached_embeddings(
             keep_ratio=keep_ratio,
             pope_pandas_df=pope_pandas_df,
@@ -489,11 +504,12 @@ if __name__ == "__main__":
         # Clear GPU memory between experiments
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+            print("GPU cache cleared")
     
     overall_end = time.time()
     overall_time = overall_end - overall_start
     total_pruning_time = sum(pruning_times.values())
-    
+
     # Write summary to text file
     summary_path = f"./{dataset_name}_summary.txt"
     with open(summary_path, 'w') as f:
@@ -501,23 +517,28 @@ if __name__ == "__main__":
         f.write(f"{'='*80}\n")
         f.write(f"Dataset: {dataset_name}\n")
         f.write(f"Total Overall Execution Time: {overall_time:.2f} seconds ({overall_time/60:.2f} minutes)\n")
-        f.write(f"Total Pruning Time (All Experiments): {total_pruning_time:.2f} seconds ({total_pruning_time/60:.2f} minutes)\n")
-        f.write(f"Total Inference Time (All Experiments): {(overall_time - total_pruning_time):.2f} seconds ({(overall_time - total_pruning_time)/60:.2f} minutes)\n")
+        
+        f.write(f"Total Accumulated Pruning Time: {total_pruning_time:.2f} seconds ({total_pruning_time/60:.2f} minutes)\n")
+        f.write(f"Pruning Time Percentage: {total_pruning_time/overall_time*100:.2f}%\n")
+        
         f.write(f"Start Time: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(overall_start))}\n")
         f.write(f"End Time: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(overall_end))}\n")
         f.write(f"\n{'='*80}\n")
         f.write(f"DETAILED RESULTS\n")
         f.write(f"{'='*80}\n\n")
-        f.write(f"{'Keep Ratio':<15} {'Accuracy':<15} {'Prune Time (s)':<20} {'Exec Time (s)':<20} {'Status':<15}\n")
+        # CHANGED: Added 'Prep Time (s)' to the header
+        f.write(f"{'Keep Ratio':<15} {'Accuracy':<15} {'Total Time (s)':<20} {'Prep Time (s)':<20} {'Status':<15}\n") 
         f.write(f"{'-'*85}\n")
         for keep_ratio in keep_ratios:
             accuracy = results.get(keep_ratio)
             exec_time = execution_times.get(keep_ratio, 0)
-            prune_time = pruning_times.get(keep_ratio, 0)
+            prep_time = pruning_times.get(keep_ratio, 0) # ADDED
             if accuracy is not None:
-                f.write(f"{keep_ratio:<15.3f} {accuracy:<15.2f}% {prune_time:<20.2f} {exec_time:<20.2f} {'✓':<15}\n")
+                # CHANGED: Added prep_time to the output
+                f.write(f"{keep_ratio:<15.3f} {accuracy:<15.2f}% {exec_time:<20.2f} {prep_time:<20.2f} {'✓':<15}\n")
             else:
-                f.write(f"{keep_ratio:<15.3f} {'N/A':<15} {prune_time:<20.2f} {exec_time:<20.2f} {'✗':<15}\n")
+                # CHANGED: Added prep_time to the output
+                f.write(f"{keep_ratio:<15.3f} {'N/A':<15} {exec_time:<20.2f} {prep_time:<20.2f} {'✗':<15}\n")
         f.write(f"{'='*80}\n")
     
     print(f"\nSummary saved to: {summary_path}")
@@ -527,19 +548,17 @@ if __name__ == "__main__":
     print("FINAL SUMMARY")
     print(f"{'='*80}")
     print(f"Dataset: {dataset_name}")
-    print(f"Total execution time: {overall_time:.2f} seconds ({overall_time/60:.2f} minutes)")
-    print(f"Total pruning time: {total_pruning_time:.2f} seconds ({total_pruning_time/60:.2f} minutes)")
-    print(f"Total inference time: {(overall_time - total_pruning_time):.2f} seconds ({(overall_time - total_pruning_time)/60:.2f} minutes)\n")
-    print(f"{'Keep Ratio':<15} {'Accuracy':<15} {'Prune Time (s)':<20} {'Exec Time (s)':<20} {'Status':<15}")
+    print(f"Total execution time: {overall_time:.2f} seconds ({overall_time/60:.2f} minutes)\n")
+    print(f"{'Keep Ratio':<15} {'Accuracy':<15} {'Total Time (s)':<20} {'Prep Time (s)':<20} {'Status':<15}")
     print(f"{'-'*85}")
     for keep_ratio in keep_ratios:
         accuracy = results.get(keep_ratio)
         exec_time = execution_times.get(keep_ratio, 0)
-        prune_time = pruning_times.get(keep_ratio, 0)
+        prep_time = pruning_times.get(keep_ratio, 0) # ADDED
         if accuracy is not None:
-            print(f"{keep_ratio:<15.3f} {accuracy:<15.2f}% {prune_time:<20.2f} {exec_time:<20.2f} {'✓':<15}")
+            print(f"{keep_ratio:<15.3f} {accuracy:<15.2f}% {exec_time:<20.2f} {prep_time:<20.2f} {'✓':<15}")
         else:
-            print(f"{keep_ratio:<15.3f} {'N/A':<15} {prune_time:<20.2f} {exec_time:<20.2f} {'✗':<15}")
+            print(f"{keep_ratio:<15.3f} {'N/A':<15} {exec_time:<20.2f} {prep_time:<20.2f} {'✗':<15}")
     print(f"{'='*80}\n")
     
     spark.stop()

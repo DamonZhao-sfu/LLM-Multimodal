@@ -16,6 +16,7 @@ from util.utils import *
 from util.cdencoder import *
 from util.utils import _generate_prompt
 from util.trimTokenator import *
+from util.visual_util import *
 
 # Get the absolute path of the project root
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "./"))
@@ -150,7 +151,7 @@ def record_timing(keep_ratio: float, preprocess_time: float, encode_time: float,
 
 
 def extract_image_binary_from_pope_data(image_path):
-    with open("/home/haikai/images_train/" + image_path, 'rb') as image_file:
+    with open("/scratch/hpc-prf-haqc/haikai/dataset/scivqa/images_train/" + image_path, 'rb') as image_file:
         binary_data = image_file.read()
     return binary_data
 
@@ -165,7 +166,7 @@ def preprocess_and_cache_pruned_embeddings(
     """Returns pruned cache and total pruning time."""
     # Load models once for all preprocessing
     print("Loading vision models...")
-    vision_tower, model, tokenizer = load_vision_models(device=device)
+    vision_tower, model, processor = load_vision_models_llava_next(device='cuda')
     
     try:
         # Group questions by image
@@ -193,9 +194,6 @@ def preprocess_and_cache_pruned_embeddings(
         for image_idx, (image_id, image_group) in enumerate(image_groups):
             num_questions = len(image_group)
             
-            # print(f"\n[{image_idx + 1}/{unique_images}] Processing image: {image_id}")
-            # print(f"  Number of questions: {num_questions}")
-            
             try:
                 # Get image data (same for all rows with this image_id)
                 image_path = image_group.iloc[0][image_column]
@@ -214,27 +212,9 @@ def preprocess_and_cache_pruned_embeddings(
                 # Prune image with combined guidance
                 prune_start = time.time()
                 
-                if keep_ratio == 1:
-                    # No pruning, use original tokens
-                    reduced_tokens, preprocess_time, encode_time  = getOriginalVisualToken(
-                                model,
-                                vision_tower,
-                                image_binary
-                    )
-                    # Record timing with zeros for no pruning
-                    record_timing(keep_ratio, preprocess_time, encode_time, 0.0)
-    
-                else:
-                    # Prune with combined guidance
-                    reduced_tokens, preprocess_time, encode_time, prune_time = trimTokenatorPruning(
-                                model,
-                                vision_tower,
-                                tokenizer,
-                                image_binary,
-                                combined_guidance,
-                                keep_ratio=keep_ratio
-                    )
-                    record_timing(keep_ratio, preprocess_time, encode_time, prune_time) 
+                reduced_tokens, preprocess_time, encode_time, prune_time = get_inputs_embeds_trim(model, processor, image_binary, keep_ratio=keep_ratio)
+
+                record_timing(keep_ratio, preprocess_time, encode_time, prune_time) 
                 
                 
                 prune_end = time.time()
@@ -243,9 +223,9 @@ def preprocess_and_cache_pruned_embeddings(
                 
                 # Cache the pruned embedding
                 pruned_cache[image_id] = {
-                    'embedding': reduced_tokens.to(torch.float16),
+                    'embedding': reduced_tokens.detach().cpu().to(torch.float16),
                     'prune_time': prune_time,
-                    'original_tokens': 576,  # LLaVA default
+                    'keep_ratio': keep_ratio,
                     'pruned_tokens': reduced_tokens.shape[1],
                     'num_questions': num_questions,
                     'guidance_length': len(combined_guidance)
@@ -279,7 +259,6 @@ def preprocess_and_cache_pruned_embeddings(
     finally:
         # Clean up models
         print("\nCleaning up vision models...")
-        cleanup_vision_models(vision_tower, model)
         print("Cleanup complete.")
 
 
@@ -326,16 +305,34 @@ def inference_with_cached_embeddings(
             
             elif field_type == "image":
                 user_prompt = user_prompt.replace(placeholder, "[image]")
-                
-                # Retrieve cached embedding instead of processing image
                 if image_source and image_source in embedding_cache:
+                    # Ensure it is a Tensor and on CPU
                     pruned_embedding = embedding_cache[image_source]['embedding']
+                    if not isinstance(pruned_embedding, torch.Tensor):
+                        pruned_embedding = torch.tensor(pruned_embedding)
+                    all_pruned_embeddings.append(pruned_embedding)
                 else:
-                    print(f"Warning: No cached embedding found for image_id: {image_source}")
-                    pruned_embedding = None
+                    all_pruned_embeddings.append(torch.zeros(1, 4096))
         
         user_prompts.append(user_prompt)
-        all_pruned_embeddings.append(pruned_embedding)
+    
+    if embedding_cache[image_source]['keep_ratio'] != 1 and all_pruned_embeddings:
+        max_len = max(emb.shape[0] for emb in all_pruned_embeddings)
+        padded_embeddings = []
+        for emb in all_pruned_embeddings:
+            current_len = emb.shape[0]
+            if current_len < max_len:
+                # Pad the bottom with zeros: (pad_left, pad_right, pad_top, pad_bottom)
+                pad_amount = max_len - current_len
+                # F.pad format for 2D is (last_dim_left, last_dim_right, 2nd_last_left, 2nd_last_right)
+                # We want to pad dimension 0 (rows), so we pad the 2nd to last dimension.
+                padded_emb = F.pad(emb, (0, 0, 0, pad_amount), "constant", 0)
+                padded_embeddings.append(padded_emb)
+            else:
+                padded_embeddings.append(emb)
+        
+        # Replace the original list with the padded list
+        all_pruned_embeddings = padded_embeddings
     
     # Generate full prompts
     prompts = [
@@ -370,7 +367,7 @@ def inference_with_cached_embeddings(
                     api_url=(base_url + "/chat/completions"),
                     guided_choice=guided_choice,
                     answer_schema=answer_schema,
-                    image_embeddings=[all_pruned_embeddings[i]] if all_pruned_embeddings[i] is not None else None
+                    image_embeddings=[[all_pruned_embeddings[i]]]
                 )
                 tasks.append(task)
             
@@ -434,7 +431,7 @@ def create_llm_udf_with_cached_embeddings(embedding_cache: Dict[str, Dict], imag
         fields_list = merged_df.to_dict('records')
 
         outputs = inference_with_cached_embeddings(
-            modelname="llava-hf/llava-1.5-7b-hf",
+            modelname="llava-hf/llava-v1.6-mistral-7b-hf",
             fields=fields_list,
             query=prompt_template,
             typed_fields=typed_fields,
@@ -580,7 +577,7 @@ def calculate_accuracy(csv_path: str, keep_ratio: float) -> float:
 
 # Main execution
 if __name__ == "__main__":
-    keep_ratios = [1,0.9,0.8,0.7,0.6,0.5,0.4,0.3,0.2,0.1]
+    keep_ratios = [0.056, 0.112, 0.224, 0.448, 0.56, 0.672, 0.784, 0.896, 1]
     dataset_name = "SciVQA_grouping_trim"
     
     overall_start = time.time()
@@ -591,7 +588,7 @@ if __name__ == "__main__":
         .option("multiLine", "true") \
         .option("encoding", "UTF-8") \
         .json(POPE_PATH) \
-        .limit(1000) \
+        .limit(10) \
         .cache()
     pope_df.createOrReplaceTempView("pope")
     

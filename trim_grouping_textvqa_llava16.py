@@ -3,12 +3,9 @@ import os
 import time
 import pandas as pd
 import torch
-import asyncio
-import json
-import csv
 from typing import Dict, List, Tuple, Any
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import regexp_replace, col, when, lower, trim
+from pyspark.sql.functions import regexp_replace, col, when, lower, trim, get_json_object, expr
 from pyspark.sql.functions import pandas_udf, col, when, lower, trim
 from pyspark.sql.types import StringType
 from util.mllm import *
@@ -16,6 +13,11 @@ from util.utils import *
 from util.cdencoder import *
 from util.utils import _generate_prompt
 from util.trimTokenator import *
+import json
+import asyncio
+import csv
+from util.cdpruner import *
+from util.visual_util import *
 
 # Get the absolute path of the project root
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "./"))
@@ -42,6 +44,9 @@ spark = SparkSession.builder \
 # Global variables for model configuration
 API_URL = "http://localhost:8000/v1/chat/completions"
 RECOVERY_RATIO = 0.0
+TOTAL_PRUNING_TIME = 0.0
+TIMING_CSV_FILE = None
+INVOCATION_COUNTER = 0
 
 def initialize_timing_csv(keep_ratio: float, dataset_name: str):
     """Initialize CSV file for timing records."""
@@ -88,6 +93,7 @@ def extract_image_binary_from_pope_data(image_data):
         return image_data[0] if len(image_data) > 0 else image_data
     return image_data
 
+
 def preprocess_and_cache_pruned_embeddings(
     df: pd.DataFrame,
     image_column: str,
@@ -99,7 +105,7 @@ def preprocess_and_cache_pruned_embeddings(
     """Returns pruned cache and total pruning time."""
     # Load models once for all preprocessing
     print("Loading vision models...")
-    vision_tower, model, tokenizer = load_vision_models(device=device)
+    vision_tower, model, processor = load_vision_models_llava_next(device='cuda')
     
     try:
         # Group questions by image
@@ -126,13 +132,13 @@ def preprocess_and_cache_pruned_embeddings(
         # Process each unique image
         for image_idx, (image_id, image_group) in enumerate(image_groups):
             num_questions = len(image_group)
-            
+        
             try:
                 # Get image data (same for all rows with this image_id)
                 image_data = image_group.iloc[0][image_column]
                 # Extract image binary
                 image_binary = extract_image_binary_from_pope_data(image_data)
-                
+
                 # Collect all questions for this image
                 all_questions = image_group[question_column].tolist()
                 
@@ -142,34 +148,10 @@ def preprocess_and_cache_pruned_embeddings(
                     f"Extract the image's key information based on the below questions: "
                     f"{questions_text}"
                 )
-                
-                prune_start = time.time()
-                
-                if keep_ratio == 1:
-                    # No pruning, use original tokens
-                    reduced_tokens, preprocess_time, encode_time  = getOriginalVisualToken(
-                                model,
-                                vision_tower,
-                                image_binary
-                    )
-                    # Record timing with zeros for no pruning
-                    record_timing(keep_ratio, preprocess_time, encode_time, 0.0)
-    
-                else:
-                    # Prune with combined guidance
-                    reduced_tokens, preprocess_time, encode_time, prune_time = trimTokenatorPruning(
-                                model,
-                                vision_tower,
-                                tokenizer,
-                                image_binary,
-                                combined_guidance,
-                                keep_ratio=keep_ratio
-                    )
-                    record_timing(keep_ratio, preprocess_time, encode_time, prune_time) 
-                
-                
-                prune_end = time.time()
-                prune_time = prune_end - prune_start
+                # Prune image with combined guidance       
+                reduced_tokens, preprocess_time, encode_time, prune_time = get_inputs_embeds_trim(model, processor, image_binary, keep_ratio=keep_ratio)
+                record_timing(keep_ratio, preprocess_time, encode_time, prune_time)
+
                 total_pruning_time += prune_time
                 
                 # Cache the pruned embedding
@@ -191,6 +173,14 @@ def preprocess_and_cache_pruned_embeddings(
                 traceback.print_exc()
                 continue
         
+        # print("\n" + "=" * 80)
+        # print("PREPROCESSING COMPLETE")
+        # print("=" * 80)
+        # print(f"✅ Successfully pruned: {successful_prunes} images")
+        # print(f"❌ Failed to prune: {failed_prunes} images")
+        # print(f"⏱️  Total pruning time: {total_pruning_time:.2f}s")
+        # print(f"⏱️  Average time per image: {total_pruning_time / successful_prunes:.2f}s" if successful_prunes > 0 else "N/A")
+        # print("=" * 80)
         
         return pruned_cache, total_pruning_time
     
@@ -230,65 +220,98 @@ def inference_with_cached_embeddings(
             
             elif field_type == "image":
                 user_prompt = user_prompt.replace(placeholder, "[image]")
-                
-                # Retrieve cached embedding instead of processing image
                 if image_source and image_source in embedding_cache:
+                    # Ensure it is a Tensor and on CPU
                     pruned_embedding = embedding_cache[image_source]['embedding']
+                    if not isinstance(pruned_embedding, torch.Tensor):
+                        pruned_embedding = torch.tensor(pruned_embedding)
+                    all_pruned_embeddings.append(pruned_embedding)
                 else:
-                    print(f"Warning: No cached embedding found for image_id: {image_source}")
-                    pruned_embedding = None
+                    all_pruned_embeddings.append(torch.zeros(1, 4096)) # Fallback empty
         
-        user_prompts.append(user_prompt)
-        all_pruned_embeddings.append(pruned_embedding)
+        user_prompts.append(user_prompt)    
+    
+    if all_pruned_embeddings:
+        max_len = max(emb.shape[0] for emb in all_pruned_embeddings)
+        padded_embeddings = []
+        for emb in all_pruned_embeddings:
+            current_len = emb.shape[0]
+            if current_len < max_len:
+                # Pad the bottom with zeros: (pad_left, pad_right, pad_top, pad_bottom)
+                pad_amount = max_len - current_len
+                # F.pad format for 2D is (last_dim_left, last_dim_right, 2nd_last_left, 2nd_last_right)
+                # We want to pad dimension 0 (rows), so we pad the 2nd to last dimension.
+                padded_emb = F.pad(emb, (0, 0, 0, pad_amount), "constant", 0)
+                padded_embeddings.append(padded_emb)
+            else:
+                padded_embeddings.append(emb)
+        
+        all_pruned_embeddings = padded_embeddings
     
     # Generate full prompts
     prompts = [
-        _generate_prompt(user_prompt=user_prompt, system_prompt=system_prompt)
+        _generate_prompt(user_prompt=user_prompt, system_prompt=DEFAULT_SYSTEM_PROMPT)
         for user_prompt in user_prompts
     ]
     
     # Send requests to API
     outputs = []
-    
-    async def fetch_all():
-        tasks = []
-        for i, prompt in enumerate(prompts):
-            task = asyncio.to_thread(
-                post_http_request_with_embeds,
-                modelname,
-                [prompt],
-                temperature=0,
-                api_url=(base_url + "/chat/completions"),
-                guided_choice=guided_choice,
-                image_embeddings=[all_pruned_embeddings[i]] if all_pruned_embeddings[i] is not None else None
-            )
-            tasks.append(task)
-        
-        # Gather all responses concurrently
-        responses = await asyncio.gather(*tasks)
-        
-        # Process responses in order
-        processed_outputs = []
-        for response in responses:
-            try:
-                # Assuming response has a .content attribute like a requests.Response
-                request_output = json.loads(response.content) 
-                choices = request_output.get('choices', [])
-                
-                if choices and 'message' in choices[0] and 'content' in choices[0]['message']:
-                    processed_outputs.append(choices[0]['message']['content'])
-                else:
-                    # Log error or empty response
-                    print(f"Warning: No valid content in response. Output: {request_output}")
-                    processed_outputs.append(None)
-            except Exception as e:
-                # Log exception
-                print(f"Error processing response: {e}. Response content: {getattr(response, 'content', 'N/A')}")
-                processed_outputs.append(None)
-                
-        return processed_outputs
 
-    outputs = asyncio.run(fetch_all())    
+    answer_schema = {
+        "type": "object",
+        "properties": {
+            "Answer": {
+                "type": "string"
+            }
+        },
+        "required": ["Answer"]
+    }
+
+    if base_url:            
+        async def fetch_all():    
+            tasks = []
+            for i, prompt in enumerate(prompts):
+                task = asyncio.to_thread(
+                    post_http_request_with_embeds,
+                    modelname,
+                    [prompt],
+                    temperature=0,
+                    api_url=(base_url + "/chat/completions"),
+                    guided_choice=guided_choice,
+                    answer_schema=answer_schema,
+                    image_embeddings=[[all_pruned_embeddings[i]]]
+                )
+                tasks.append(task)
+            
+            # Gather all responses concurrently
+            responses = await asyncio.gather(*tasks)
+            
+            # Process responses in order
+            processed_outputs = []
+            for response in responses:
+                try:
+                    # Assuming response has a .content attribute like a requests.Response
+                    request_output = json.loads(response.content) 
+                    choices = request_output.get('choices', [])
+                    
+                    if choices and 'message' in choices[0] and 'content' in choices[0]['message']:
+                        processed_outputs.append(choices[0]['message']['content'])
+                    else:
+                        # Log error or empty response
+                        print(f"Warning: No valid content in response. Output: {request_output}")
+                        processed_outputs.append(None)
+                except Exception as e:
+                    # Log exception
+                    print(f"Error processing response: {e}. Response content: {getattr(response, 'content', 'N/A')}")
+                    processed_outputs.append(None)
+                    
+            return processed_outputs
+
+        # Run the async main function from our synchronous context
+        # This will block until all concurrent requests are complete
+        outputs = asyncio.run(fetch_all())            
+        return outputs
+
     return outputs
 
 
@@ -320,7 +343,7 @@ def create_llm_udf_with_cached_embeddings(embedding_cache: Dict[str, Dict], imag
         fields_list = merged_df.to_dict('records')
 
         outputs = inference_with_cached_embeddings(
-            modelname="llava-hf/llava-1.5-7b-hf",
+            modelname="llava-hf/llava-v1.6-mistral-7b-hf",
             fields=fields_list,
             query=prompt_template,
             typed_fields=typed_fields,
@@ -343,21 +366,17 @@ def run_experiment_with_cached_embeddings(
     """Run experiment with cached embeddings for a specific keep_ratio.
     Returns: (output_path, execution_time, pruning_time)
     """
-    print(f"\n{'='*80}")
-    print(f"Running experiment with keep_ratio={keep_ratio}")
-    print(f"{'='*80}\n")
     initialize_timing_csv(keep_ratio, dataset_name)
     start_time = time.time()
     
     # Preprocess and cache pruned embeddings
-    print(f"Preprocessing images with keep_ratio={keep_ratio}...")
     embedding_cache, pruning_time = preprocess_and_cache_pruned_embeddings(
         df=pope_pandas_df,
         image_column='image',
         question_column='question',
         image_id_column='image_id',
         keep_ratio=keep_ratio,
-        device='cuda:0'
+        device='cuda'
     )
     
     # Create image source mapping
@@ -376,23 +395,40 @@ def run_experiment_with_cached_embeddings(
     # Execute query
     result_df = spark.sql("""
         SELECT 
-            multiple_choice_answer,
-            LLM('Given the question: {text:question} and candidate answers {text:answers} and {text:answer_type} and image: {image:image}, give me the answer to the question', question, answers, answer_type, image) as predicted
+            answers,
+            LLM('Given the question: {text:question} and image: {image:image}, give me the answer to the question', question, image) as predicted
         FROM pope
     """)
     
-    result_df_with_comparison = result_df.withColumn(
-    "is_correct",
-    when(
-        lower(col("predicted")).contains(lower(trim(col("multiple_choice_answer")))),
-        1
-    ).otherwise(0)).drop("predicted")
+    result_df_cleaned = result_df.withColumn(
+        "predicted",
+        regexp_replace(col("predicted"), r"[\n\r]+", " ")  # Replace newlines with space
+    ).withColumn(
+        "predicted",
+        regexp_replace(col("predicted"), r"\s+", " ")  # Replace multiple spaces with single space
+    ).withColumn(
+        "predicted",
+        trim(col("predicted"))  # Trim leading/trailing whitespace
+    )
+
+    result_df_with_comparison = result_df_cleaned.withColumn(
+        "answer_text",
+        lower(trim(get_json_object(col("predicted"), "$.Answer")))
+    ).withColumn(
+        "is_correct",
+        when(
+            expr("exists(answers, x -> lower(trim(answer_text)) like concat('%', lower(trim(x)), '%'))"),
+            1
+        ).otherwise(0)
+    ).drop("answer_text", "answers")
     
     # Write results to CSV with semicolon separator
     output_path = f"./{dataset_name}_{keep_ratio}.csv"
     result_df_with_comparison.coalesce(1).write.mode("overwrite") \
         .option("header", "true") \
         .option("sep", ";") \
+        .option("quote", '"') \
+        .option("escape", '"') \
         .csv(output_path)
     
     end_time = time.time()
@@ -453,13 +489,13 @@ def calculate_accuracy(csv_path: str, keep_ratio: float) -> float:
 
 # Main execution
 if __name__ == "__main__":
-    keep_ratios = [1, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1]
-    dataset_name = "vqa_trim_grouping"
+    keep_ratios = [0.056, 0.112, 0.224, 0.448, 0.56, 0.672, 0.784, 0.896, 1]
+    dataset_name = "textvqa_trim_grouping_llava16"
     
     overall_start = time.time()
     
     # Read POPE parquet once
-    POPE_PATH = "/scratch/hpc-prf-haqc/haikai/dataset/VQAv2/validation-00000-of-00068.parquet"
+    POPE_PATH = "/scratch/hpc-prf-haqc/haikai/dataset/VQAText/validation-00000-of-00003.parquet"
     pope_df = spark.read.parquet(POPE_PATH)
     pope_df.createOrReplaceTempView("pope")
     
