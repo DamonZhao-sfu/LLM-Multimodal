@@ -222,7 +222,7 @@ def inference_with_cached_embeddings(
         
         user_prompts.append(user_prompt)    
     
-    if embedding_cache[image_source]['keep_ratio'] != 1 and all_pruned_embeddings:
+    if all_pruned_embeddings:
         max_len = max(emb.shape[0] for emb in all_pruned_embeddings)
         padded_embeddings = []
         for emb in all_pruned_embeddings:
@@ -481,14 +481,14 @@ def calculate_accuracy(csv_path: str, keep_ratio: float) -> float:
 # Main execution
 if __name__ == "__main__":
     #keep_ratios = [0.056, 0.112, 0.224, 0.448, 0.56, 0.672, 0.784, 0.896, 1]
-    keep_ratios = [1]
+    keep_ratios = [0.056, 0.112, 0.224, 0.448, 0.56, 0.672, 0.784, 0.896]
     dataset_name = "textvqa_trim_grouping_llava16"
     
     overall_start = time.time()
     
     # Read POPE parquet once
     POPE_PATH = "/scratch/hpc-prf-haqc/haikai/dataset/VQAText/validation-00000-of-00003.parquet"
-    pope_df = spark.read.parquet(POPE_PATH).limit(10)
+    pope_df = spark.read.parquet(POPE_PATH)
     pope_df.createOrReplaceTempView("pope")
     
     # Convert to pandas once
