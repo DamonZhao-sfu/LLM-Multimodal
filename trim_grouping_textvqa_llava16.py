@@ -103,12 +103,10 @@ def preprocess_and_cache_pruned_embeddings(
     device: str = 'cuda:0'
 ) -> Tuple[Dict[str, Dict], float]:
     """Returns pruned cache and total pruning time."""
-    # Load models once for all preprocessing
     print("Loading vision models...")
     vision_tower, model, processor = load_vision_models_llava_next(device='cuda')
     
     try:
-        # Group questions by image
         print(f"\nGrouping questions by {image_id_column}...")
         image_groups = df.groupby(image_id_column)
         unique_images = len(image_groups)
@@ -116,7 +114,6 @@ def preprocess_and_cache_pruned_embeddings(
         print(f"Found {unique_images} unique images")
         print(f"Total questions in dataset: {len(df)}")
         
-        # Display image distribution
         image_counts = df.groupby(image_id_column).size().sort_values(ascending=False)
         print(f"\nTop 10 most frequently used images:")
         for img_id, count in image_counts.head(10).items():
@@ -129,32 +126,24 @@ def preprocess_and_cache_pruned_embeddings(
         successful_prunes = 0
         failed_prunes = 0
         
-        # Process each unique image
         for image_idx, (image_id, image_group) in enumerate(image_groups):
             num_questions = len(image_group)
         
             try:
-                # Get image data (same for all rows with this image_id)
                 image_data = image_group.iloc[0][image_column]
-                # Extract image binary
                 image_binary = extract_image_binary_from_pope_data(image_data)
 
-                # Collect all questions for this image
                 all_questions = image_group[question_column].tolist()
                 
-                # Create combined guidance prompt
                 questions_text = ", ".join([f'"{q}"' for q in all_questions])
                 combined_guidance = (
                     f"Extract the image's key information based on the below questions: "
                     f"{questions_text}"
                 )
-                # Prune image with combined guidance       
                 reduced_tokens, preprocess_time, encode_time, prune_time = get_inputs_embeds_trim(model, processor, image_binary, keep_ratio=keep_ratio)
                 record_timing(keep_ratio, preprocess_time, encode_time, prune_time)
 
-                total_pruning_time += prune_time
-                
-                # Cache the pruned embedding
+                total_pruning_time += prune_time                
                 pruned_cache[image_id] = {
                     'embedding': reduced_tokens.detach().cpu().to(torch.float16),
                     'prune_time': prune_time,
@@ -489,7 +478,7 @@ def calculate_accuracy(csv_path: str, keep_ratio: float) -> float:
 
 # Main execution
 if __name__ == "__main__":
-    keep_ratios = [0.056, 0.112, 0.224, 0.448, 0.56, 0.672, 0.784, 0.896, 1]
+    keep_ratios = [0.056, 0.112, 0.224, 0.448, 0.56, 0.672, 0.784, 0.896]
     dataset_name = "textvqa_trim_grouping_llava16"
     
     overall_start = time.time()

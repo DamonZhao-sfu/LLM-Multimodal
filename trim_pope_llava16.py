@@ -103,7 +103,6 @@ def execute_batch_pope_with_pruned_embeddings(
         for field_dict in fields:
             # Initialize prompt with empty string - we'll build it from scratch
             user_prompt = ""
-            pruned_embeddings_for_this_prompt = []
             
             # Build prompt following the REORDERED column sequence
             for field_name in reordered_columns:

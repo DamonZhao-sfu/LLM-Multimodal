@@ -232,27 +232,13 @@ def preprocess_and_cache_pruned_embeddings(
                 }
                 
                 successful_prunes += 1
-                
-                # print(f"  ✅ Pruning successful!")
-                # print(f"  📊 Original: 576 tokens → Pruned: {reduced_tokens.shape[1]} tokens")
-                # print(f"  📉 Reduction: {((576 - reduced_tokens.shape[1]) / 576 * 100):.1f}%")
-                # print(f"  ⏱️  Time: {prune_time:.2f}s")
-                
+                 
             except Exception as e:
                 failed_prunes += 1
                 print(f"  ❌ Error pruning image {image_id}: {e}")
                 import traceback
                 traceback.print_exc()
                 continue
-        
-        # print("\n" + "=" * 80)
-        # print("PREPROCESSING COMPLETE")
-        # print("=" * 80)
-        # print(f"✅ Successfully pruned: {successful_prunes} images")
-        # print(f"❌ Failed to prune: {failed_prunes} images")
-        # print(f"⏱️  Total pruning time: {total_pruning_time:.2f}s")
-        # print(f"⏱️  Average time per image: {total_pruning_time / successful_prunes:.2f}s" if successful_prunes > 0 else "N/A")
-        # print("=" * 80)
         
         return pruned_cache, total_pruning_time
     

@@ -3,11 +3,11 @@ import os
 import time
 import csv
 import pandas as pd
-from typing import Tuple, List, Dict, Any, Callable
+from typing import Tuple, List, Dict, Any
 from util.utils import _generate_prompt
 import asyncio
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import pandas_udf, col, when, lower, trim
+from pyspark.sql.functions import pandas_udf
 from pyspark.sql.types import StringType
 from util.mllm import *
 from util.utils import *
@@ -15,12 +15,63 @@ from util.cdencoder import *
 from util.cdpruner import *
 from util.trimTokenator import *
 from util.visual_util import *
-
-
+from transformers import CLIPProcessor, CLIPModel
 # Get the absolute path of the project root
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "./"))
 sys.path.insert(0, project_root)
 
+AQP_SIMILARITY_THRESHOLD=0.2
+_aqp_model = None
+_aqp_processor = None
+
+
+def get_aqp_model(device='cuda'):
+    global _aqp_model, _aqp_processor
+    if _aqp_model is None:
+        print("Loading AQP Proxy Model (CLIP)...")
+        # specific lightweight model
+        model_id = "/scratch/hpc-prf-haqc/haikai/clip-vit-base-patch32" 
+        _aqp_model = CLIPModel.from_pretrained(model_id).to(device)
+        _aqp_processor = CLIPProcessor.from_pretrained(model_id)
+        _aqp_model.eval()
+    return _aqp_model, _aqp_processor
+
+
+def check_aqp_similarity(image_binary, candidate_text, threshold=0.2):
+    """
+    Returns True if the image and text are similar enough to proceed.
+    Returns False if they are too different (should be skipped).
+    """
+    model, processor = get_aqp_model()
+    
+    # Load image from bytes
+    image = Image.open(io.BytesIO(image_binary))
+    
+    # Process inputs (Text + Image)
+    # Truncate text to fit CLIP context length (77 tokens usually)
+    inputs = processor(
+        text=[candidate_text], 
+        images=image, 
+        return_tensors="pt", 
+        padding=True
+    ).to(model.device)
+
+    with torch.no_grad():
+        outputs = model(**inputs)
+        
+        # CLIP calculates the dot product (logits_per_image)
+        # We normalize specific to the model, but logits_per_image is usually the raw score
+        logits_per_image = outputs.logits_per_image  # shape: [1, 1]
+        probs = logits_per_image.softmax(dim=1) # standard softmax
+        
+        # Alternative: Normalized Cosine Similarity (more interpretable)
+        image_embeds = outputs.image_embeds / outputs.image_embeds.norm(p=2, dim=-1, keepdim=True)
+        text_embeds = outputs.text_embeds / outputs.text_embeds.norm(p=2, dim=-1, keepdim=True)
+        similarity = torch.matmul(image_embeds, text_embeds.t()).item()
+
+    # Decision Logic
+    # 0.2 is a common heuristic threshold for CLIP ViT-B/32
+    return similarity >= threshold, similarity
 
 # Spark configuration
 spark = SparkSession.builder \
@@ -88,7 +139,7 @@ def execute_batch_pope_with_pruned_embeddings(
     query: str,
     keep_ratio: float,
     typed_fields: List[Tuple[str, str]],
-    reordered_columns: List[str],  # NEW: List of columns in reordered sequence
+    reordered_columns: List[str],
     system_prompt: str = DEFAULT_SYSTEM_PROMPT,
     guided_choice: List[str] = None,
     base_url: str = "http://localhost:8000/v1",
@@ -96,92 +147,100 @@ def execute_batch_pope_with_pruned_embeddings(
     """Returns tuple of (outputs, pruning_time)"""
     tokenizer, model, processor = load_vision_models_llava_next(device='cuda')
     try:
-        # Build user prompts and generate pruned embeddings
         user_prompts = []
         all_pruned_embeddings = []
-        
-        for field_dict in fields:
-            # Initialize prompt with empty string - we'll build it from scratch
+        skipped_indices = []
+        for idx, field_dict in enumerate(fields):
             user_prompt = ""
             
-            # Build prompt following the REORDERED column sequence
+            row_embedding = None            
+            current_image_binary = None
+            current_text_concept = ""
+
             for field_name in reordered_columns:
-                # Find the field type for this field name
-                field_type = None
-                for fname, ftype in typed_fields:
-                    if fname == field_name:
-                        field_type = ftype
-                        break
-                
-                if field_type is None:
-                    continue  # Skip if field not found in typed_fields
+                field_type = next((ftype for fname, ftype in typed_fields if fname == field_name), None)
+                if not field_type: continue
+
                 if field_type == "text":
-                    value = field_dict.get(field_name, "")
-                    user_prompt += f"{field_name}: {value}\n"
+                    val = field_dict.get(field_name, "")
+                    user_prompt += f"{field_name}: {val}\n"
+                    current_text_concept += f"{val} "
                 
                 elif field_type == "image":
                     user_prompt += f"{field_name}: [image]\n"
                     image_data = field_dict.get(field_name)
-                    
                     if image_data is not None:
-                        image_binary = extract_image_binary_from_pope_data(image_data)
-                        
-                        reduced_tokens, preprocess_time, encode_time, prune_time = get_inputs_embeds_trim(model, processor, image_binary, keep_ratio=keep_ratio)
-                        record_timing(keep_ratio, preprocess_time, encode_time, prune_time)
-                        all_pruned_embeddings.append(reduced_tokens.detach().cpu().to(torch.float16))
-            
-            user_prompts.append(user_prompt.strip())  # Remove trailing newline
+                        current_image_binary = extract_image_binary(image_data)            
 
-        if all_pruned_embeddings:
-            max_len = max(emb.shape[0] for emb in all_pruned_embeddings)
-            padded_embeddings = []
-            for emb in all_pruned_embeddings:
-                current_len = emb.shape[0]
-                if current_len < max_len:
-                    # Pad the bottom with zeros: (pad_left, pad_right, pad_top, pad_bottom)
-                    pad_amount = max_len - current_len
-                    # F.pad format for 2D is (last_dim_left, last_dim_right, 2nd_last_left, 2nd_last_right)
-                    # We want to pad dimension 0 (rows), so we pad the 2nd to last dimension.
-                    padded_emb = F.pad(emb, (0, 0, 0, pad_amount), "constant", 0)
-                    padded_embeddings.append(padded_emb)
+            is_relevant = True
+            if current_image_binary and current_text_concept:
+                is_relevant, score = check_aqp_similarity(
+                    current_image_binary, 
+                    current_text_concept, 
+                    threshold=AQP_SIMILARITY_THRESHOLD 
+                )
+                
+                if not is_relevant:
+                    print(f"AQP Pruning: Row {idx} skipped. Similarity {score:.3f} < {AQP_SIMILARITY_THRESHOLD}")
+                    skipped_indices.append(idx)
                 else:
-                    padded_embeddings.append(emb)
-        
-            # Replace the original list with the padded list
-            all_pruned_embeddings = padded_embeddings
+                    print(f"Similarity {score:.3f}")
 
-        # Generate full prompts
+            if idx not in skipped_indices and current_image_binary:
+                pruned_tensor, pre_t, enc_t, pr_t = get_inputs_embeds_trim(
+                    model, processor, current_image_binary, keep_ratio=keep_ratio
+                )
+                record_timing(keep_ratio, pre_t, enc_t, pr_t)
+                row_embedding = pruned_tensor.detach().cpu().to(torch.float16)
+                user_prompts.append(user_prompt.strip())
+            
+            if row_embedding is not None:
+                all_pruned_embeddings.append(row_embedding)
+
+
+        # if all_pruned_embeddings:
+        #     max_len = max(emb.shape[0] for emb in all_pruned_embeddings)
+        #     padded_embeddings = []
+        #     for emb in all_pruned_embeddings:
+        #         current_len = emb.shape[0]
+        #         if current_len < max_len:
+        #             # Pad the bottom with zeros: (pad_left, pad_right, pad_top, pad_bottom)
+        #             pad_amount = max_len - current_len
+        #             # F.pad format for 2D is (last_dim_left, last_dim_right, 2nd_last_left, 2nd_last_right)
+        #             # We want to pad dimension 0 (rows), so we pad the 2nd to last dimension.
+        #             padded_emb = F.pad(emb, (0, 0, 0, pad_amount), "constant", 0)
+        #             padded_embeddings.append(padded_emb)
+        #         else:
+        #             padded_embeddings.append(emb)
+        
+        #     # Replace the original list with the padded list
+        #     all_pruned_embeddings = padded_embeddings
+
         prompts = [_generate_prompt(user_prompt=user_prompt, system_prompt=system_prompt) 
                    for user_prompt in user_prompts]
-
+        print("len of prompts")
+        print(len(prompts))
         outputs = []
-        if base_url:            
-            async def fetch_all():
-                tasks = []
-                for i, prompt in enumerate(prompts):
-                    task = asyncio.to_thread(
-                        post_http_request_with_embeds,
-                        modelname,
-                        [prompt],
-                        temperature=0,
-                        api_url=(base_url + "/chat/completions"),
-                        guided_choice=guided_choice,
-                        image_embeddings=[[all_pruned_embeddings[i]]]
-                    )
-                    tasks.append(task)
-                
-                # Gather all responses concurrently
-                responses = await asyncio.gather(*tasks)
-                
-                # Process responses in order
+        if base_url:    
+            def fetch_all():
                 processed_outputs = []
-                for response in responses:
+                for i, prompt in enumerate(prompts):
                     try:
-                        # Assuming response has a .content attribute like a requests.Response
-                        request_output = json.loads(response.content) 
-                        choices = request_output.get('choices', [])
+                        print("send to inference")
+                        response = post_http_request_with_embeds(
+                            modelname,
+                            [prompt],
+                            temperature=0,
+                            api_url=(base_url + "/chat/completions"),
+                            guided_choice=guided_choice,
+                            image_embeddings=[[all_pruned_embeddings[i]]]
+                        )
                         
+                        request_output = json.loads(response.content)
+                        choices = request_output.get('choices', [])
+
                         if choices and 'message' in choices[0] and 'content' in choices[0]['message']:
+                            print(choices[0]['message']['content'])
                             processed_outputs.append(choices[0]['message']['content'])
                         else:
                             # Log error or empty response
@@ -191,11 +250,48 @@ def execute_batch_pope_with_pruned_embeddings(
                         # Log exception
                         print(f"Error processing response: {e}. Response content: {getattr(response, 'content', 'N/A')}")
                         processed_outputs.append(None)
-                        
+
                 return processed_outputs
 
-            outputs = asyncio.run(fetch_all())            
+            outputs = fetch_all()
             return outputs
+            # async def fetch_all():
+            #     tasks = []
+            #     for i, prompt in enumerate(prompts):
+            #         task = asyncio.to_thread(
+            #             post_http_request_with_embeds,
+            #             modelname,
+            #             [prompt],
+            #             temperature=0,
+            #             api_url=(base_url + "/chat/completions"),
+            #             guided_choice=guided_choice,
+            #             image_embeddings=[[all_pruned_embeddings[i]]]
+            #         )
+            #         tasks.append(task)
+                
+            #     responses = await asyncio.gather(*tasks)                
+            #     processed_outputs = []
+            #     for response in responses:
+            #         try:
+            #             # Assuming response has a .content attribute like a requests.Response
+            #             request_output = json.loads(response.content) 
+            #             choices = request_output.get('choices', [])
+                        
+            #             if choices and 'message' in choices[0] and 'content' in choices[0]['message']:
+            #                 processed_outputs.append(choices[0]['message']['content'])
+            #             else:
+            #                 # Log error or empty response
+            #                 print(f"Warning: No valid content in response. Output: {request_output}")
+            #                 processed_outputs.append(None)
+            #         except Exception as e:
+            #             # Log exception
+            #             print(f"Error processing response: {e}. Response content: {getattr(response, 'content', 'N/A')}")
+            #             processed_outputs.append(None)
+                        
+            #     return processed_outputs
+
+            # outputs = asyncio.run(fetch_all())            
+            # return outputs
     
     finally:
         torch.cuda.empty_cache()
@@ -209,7 +305,6 @@ def create_llm_udf_with_embeddings(
         prompts: pd.Series,
         *args: pd.Series
     ) -> pd.Series:      
-        print(f"Batch size: {len(prompts)}")  
         prompt_template = prompts.iloc[0]
         typed_fields = parse_typed_fields(prompt_template)
 
@@ -255,23 +350,12 @@ def create_llm_udf_with_embeddings(
     
     return llm_udf_embedding_batch
 
-
-def extract_image_binary_from_pope_data(image_data):
-    """Extract image binary from POPE data format."""
-    if isinstance(image_data, (list, tuple)):
-        return image_data[0] if len(image_data) > 0 else image_data
-    return image_data
-
+def extract_image_binary(image_path):
+    with open(image_path, 'rb') as image_file:
+        binary_data = image_file.read()
+    return binary_data
 
 def run_experiment(keep_ratio: float, dataset_name: str = "POPE_random") -> Tuple[str, float]:
-    """Run experiment with specific keep_ratio and save results.
-    Returns: (output_path, execution_time, pruning_time)
-    """
-    
-    print(f"\n{'='*80}")
-    print(f"Running experiment with keep_ratio={keep_ratio}")
-    print(f"{'='*80}\n")
-    
     # Reset pruning time for this experiment
     initialize_timing_csv(keep_ratio, dataset_name)
 
@@ -281,36 +365,64 @@ def run_experiment(keep_ratio: float, dataset_name: str = "POPE_random") -> Tupl
     llm_udf = create_llm_udf_with_embeddings(keep_ratio)
     spark.udf.register("LLM", llm_udf)
     
-    # Read POPE parquet
-    POPE_PATH = "/scratch/hpc-prf-haqc/haikai/dataset/POPE/random-00000-of-00001.parquet"
-    pope_df = spark.read.parquet(POPE_PATH)
-    pope_df.createOrReplaceTempView("pope")
-    print(f"Total records: {pope_df.count()}")
+    ap_warrior_df = spark.read \
+        .option("header", "true") \
+        .option("inferSchema", "true") \
+        .csv("/scratch/hpc-prf-haqc/haikai/SemBench/data200/files/mmqa/data/sf_200/ap_warrior.csv")
+
+    images_df = spark.read \
+        .option("header", "true") \
+        .option("inferSchema", "true") \
+        .csv("/scratch/hpc-prf-haqc/haikai/SemBench/data200/files/mmqa/data/sf_200/thalamusdb_images.csv").limit(10) \
+    
+    tampa_international_airport_df = spark.read \
+        .option("header", "true") \
+        .option("inferSchema", "true") \
+        .csv("/scratch/hpc-prf-haqc/haikai/SemBench/data200/files/mmqa/data/sf_200/tampa_international_airport.csv") \
+    
+
+    ap_warrior_df.show()
+    images_df.show()
+    tampa_international_airport_df.show()
+    
+    ap_warrior_df.createOrReplaceTempView("ap_warrior")
+    images_df.createOrReplaceTempView("images")
+    tampa_international_airport_df.createOrReplaceTempView("tampa_international_airport")
     
     # Execute query with proper column references
+    # Q2a
     result_df = spark.sql("""
-        SELECT 
-            id,
-            question_id,
-            question,
-            answer,
-            image_source,
-            LLM('Given the question: {text:question} and image: {image:image} give me the answer to the question', question, image) as predicted
-        FROM pope
-    """)
+        SELECT t.ID, i.image_filepath, LLM(
+            'You will be provided with a horse racetrack name and an image.
+            Determine if the image shows the logo of the racetrack.
+            Racetrack: {text:Track} Image: {image:image_filepath}', t.Track, i.image_filepath
+        ) FROM ap_warrior t, images i;
+    """)    
     
-    # Normalize both answer and predicted columns for comparison
-    result_df_with_comparison = result_df.withColumn(
-        "is_correct",
-        when(
-            lower(trim(col("predicted"))) == lower(trim(col("answer"))),
-            1
-        ).otherwise(0)
-    ).drop("question")
+    """
+    SELECT t.ID, i.image_filepath, LLM(
+            'You will be provided with a horse racetrack name and an image.
+            Determine if the image shows the logo of the racetrack.
+            Racetrack: {text:Track} Image: {image:image_filepath}', t.Track, i.image_filepath
+        ) FROM ap_warrior t, images i
+        WHERE LLM(
+            'You will be provided with a horse racetrack name and an image.
+            Determine if the image shows the logo of the racetrack.
+            Racetrack: {text:Track} Image: {image:image_filepath}', t.Track, i.image_filepath
+        ) = 'Yes'
+    """
     
-    # Write results to CSV
+    # Q7
+    # result_df = spark.sql("""
+    #     SELECT t.Airlines
+    #     FROM tampa_international_airport t, images i
+    #     WHERE LLM(
+    #     "You will be provided with an airline name and an image. Determine if the image shows the logo of the airline. Airline: {text:Airlines} Image: {image:image_filepath} ", t.Airlines, i.image_filepath
+    #     ) = 'Yes';
+    #     """)
+    
     output_path = f"./{dataset_name}_{keep_ratio}.csv"
-    result_df_with_comparison.coalesce(1).write.mode("overwrite").option("header", "true").csv(output_path)
+    result_df.coalesce(1).write.mode("overwrite").option("header", "true").csv(output_path)
     
     end_time = time.time()
     execution_time = end_time - start_time
@@ -375,8 +487,8 @@ def calculate_accuracy(csv_path: str, keep_ratio: float) -> float:
 
 # Main execution
 if __name__ == "__main__":
-    keep_ratios = [1]
-    dataset_name = "POPE_trim_async"
+    keep_ratios = [0.2]
+    dataset_name = "SEMbench_q2a"
     
     overall_start = time.time()
     results = {}
@@ -392,7 +504,7 @@ if __name__ == "__main__":
         execution_times[keep_ratio] = exec_time
         #pruning_times[keep_ratio] = prune_time
         
-        accuracy = calculate_accuracy(output_path, keep_ratio)
+        accuracy = 0 #calculate_accuracy(output_path, keep_ratio)
         results[keep_ratio] = accuracy
     
     overall_end = time.time()

@@ -209,7 +209,6 @@ def create_llm_udf_with_embeddings(
         prompts: pd.Series,
         *args: pd.Series
     ) -> pd.Series:      
-        print(f"Batch size: {len(prompts)}")  
         prompt_template = prompts.iloc[0]
         typed_fields = parse_typed_fields(prompt_template)
 
@@ -264,14 +263,6 @@ def extract_image_binary_from_pope_data(image_data):
 
 
 def run_experiment(keep_ratio: float, dataset_name: str = "POPE_random") -> Tuple[str, float]:
-    """Run experiment with specific keep_ratio and save results.
-    Returns: (output_path, execution_time, pruning_time)
-    """
-    
-    print(f"\n{'='*80}")
-    print(f"Running experiment with keep_ratio={keep_ratio}")
-    print(f"{'='*80}\n")
-    
     # Reset pruning time for this experiment
     initialize_timing_csv(keep_ratio, dataset_name)
 
@@ -281,22 +272,33 @@ def run_experiment(keep_ratio: float, dataset_name: str = "POPE_random") -> Tupl
     llm_udf = create_llm_udf_with_embeddings(keep_ratio)
     spark.udf.register("LLM", llm_udf)
     
-    # Read POPE parquet
-    POPE_PATH = "/scratch/hpc-prf-haqc/haikai/dataset/POPE/random-00000-of-00001.parquet"
-    pope_df = spark.read.parquet(POPE_PATH)
-    pope_df.createOrReplaceTempView("pope")
-    print(f"Total records: {pope_df.count()}")
+    ap_warrior_df = spark.read \
+        .option("header", "true") \
+        .option("inferSchema", "true") \
+        .csv("/scratch/hpc-prf-haqc/haikai/SemBench/data200/files/mmqa/data/sf_200/ap_warrior.csv")
+
+    images_df = spark.read \
+        .option("header", "true") \
+        .option("inferSchema", "true") \
+        .csv("/scratch/hpc-prf-haqc/haikai/SemBench/data200/files/mmqa/data/sf_200/thalamusdb_images.csv")
+        
+    ap_warrior_df.createOrReplaceTempView("ap_warrior")
+    images_df.createOrReplaceTempView("images")    
     
+    print("ap_warrior columns:", ap_warrior_df.columns)
+    print("images columns:", images_df.columns)
+    ap_warrior_df.show(5)
+    images_df.show(5)
+
     # Execute query with proper column references
     result_df = spark.sql("""
-        SELECT 
-            id,
-            question_id,
-            question,
-            answer,
-            image_source,
-            LLM('Given the question: {text:question} and image: {image:image} give me the answer to the question', question, image) as predicted
-        FROM pope
+        SELECT t.ID
+        FROM ap_warrior t, images i
+        WHERE LLM(
+            "You will be provided with a horse racetrack name and an image. ",
+            "Determine if the image shows the logo of the racetrack. ",
+            "Racetrack: {text:Track} Image: {image:image_filepath} ", t.Track, i.image_filepath
+        ) = 'Yes';
     """)
     
     # Normalize both answer and predicted columns for comparison
@@ -375,8 +377,8 @@ def calculate_accuracy(csv_path: str, keep_ratio: float) -> float:
 
 # Main execution
 if __name__ == "__main__":
-    keep_ratios = [1]
-    dataset_name = "POPE_trim_async"
+    keep_ratios = [0.784, 0.896, 1]
+    dataset_name = "SEMbench_q2a"
     
     overall_start = time.time()
     results = {}

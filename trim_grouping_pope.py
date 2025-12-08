@@ -220,29 +220,61 @@ def inference_with_cached_embeddings(
         user_prompts.append(user_prompt)
 
     # --- FIX START: PAD EMBEDDINGS ---
-    # if all_pruned_embeddings:
-    #     max_len = max(emb.shape[0] for emb in all_pruned_embeddings)
-    #     padded_embeddings = []
-    #     for emb in all_pruned_embeddings:
-    #         current_len = emb.shape[0]
-    #         if current_len < max_len:
-    #             # Pad the bottom with zeros: (pad_left, pad_right, pad_top, pad_bottom)
-    #             pad_amount = max_len - current_len
-    #             # F.pad format for 2D is (last_dim_left, last_dim_right, 2nd_last_left, 2nd_last_right)
-    #             # We want to pad dimension 0 (rows), so we pad the 2nd to last dimension.
-    #             padded_emb = F.pad(emb, (0, 0, 0, pad_amount), "constant", 0)
-    #             padded_embeddings.append(padded_emb)
-    #         else:
-    #             padded_embeddings.append(emb)
+    if all_pruned_embeddings:
+        max_len = max(emb.shape[0] for emb in all_pruned_embeddings)
+        padded_embeddings = []
+        for emb in all_pruned_embeddings:
+            current_len = emb.shape[0]
+            if current_len < max_len:
+                # Pad the bottom with zeros: (pad_left, pad_right, pad_top, pad_bottom)
+                pad_amount = max_len - current_len
+                # F.pad format for 2D is (last_dim_left, last_dim_right, 2nd_last_left, 2nd_last_right)
+                # We want to pad dimension 0 (rows), so we pad the 2nd to last dimension.
+                padded_emb = F.pad(emb, (0, 0, 0, pad_amount), "constant", 0)
+                padded_embeddings.append(padded_emb)
+            else:
+                padded_embeddings.append(emb)
         
-    #     # Replace the original list with the padded list
-    #     all_pruned_embeddings = padded_embeddings
+        # Replace the original list with the padded list
+        all_pruned_embeddings = padded_embeddings
 
     # Generate full prompts
     prompts = [
         _generate_prompt(user_prompt=user_prompt, system_prompt=system_prompt)
         for user_prompt in user_prompts
     ]
+    
+    # outputs = []
+    # if base_url:
+    #     for i, prompt in enumerate(prompts):
+    #         try:
+    #             response = post_http_request_with_embeds(
+    #                 modelname,
+    #                 [prompt],
+    #                 temperature=0,
+    #                 api_url=(base_url + "/chat/completions"),
+    #                 guided_choice=guided_choice,
+    #                 image_embeddings=[[all_pruned_embeddings[i]]]
+    #             )
+                
+    #             # Process response
+    #             request_output = json.loads(response.content)
+    #             choices = request_output.get('choices', [])
+                
+    #             if choices and 'message' in choices[0] and 'content' in choices[0]['message']:
+    #                 outputs.append(choices[0]['message']['content'])
+    #             else:
+    #                 # Log error or empty response
+    #                 print(f"Warning: No valid content in response. Output: {request_output}")
+    #                 outputs.append(None)
+    #         except Exception as e:
+    #             # Log exception
+    #             print(f"Error processing response: {e}. Response content: {getattr(response, 'content', 'N/A')}")
+    #             outputs.append(None)
+        
+    #     return outputs
+
+    # return outputs
 
     outputs = []
     if base_url:            
@@ -462,7 +494,7 @@ def calculate_accuracy(csv_path: str, keep_ratio: float) -> float:
 # Main execution
 if __name__ == "__main__":
     #keep_ratios = [0.056, 0.112, 0.224, 0.448, 0.56, 0.672, 0.784, 0.896, 1]
-    keep_ratios = [1]
+    keep_ratios = [0.056]
 
     dataset_name = "POPE_trim_grouping_llava16"
     
