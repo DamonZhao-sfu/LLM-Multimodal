@@ -375,7 +375,7 @@ def calculate_accuracy(csv_path: str, keep_ratio: float) -> float:
 
 # Main execution
 if __name__ == "__main__":
-    keep_ratios = [1]
+    keep_ratios = [0.056, 0.112, 0.224, 0.448, 0.56, 0.672, 0.784, 0.896]
     dataset_name = "POPE_trim_async"
     
     overall_start = time.time()
