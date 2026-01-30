@@ -37,6 +37,8 @@ from util.feature_extraction_join import (
     create_feature_extraction_udf,
     create_semantic_match_udf,
     create_feature_join_udf,
+    create_feature_join_udf_with_prompt,
+    create_llm_feature_join_udf,
     feature_extraction_join,
 )
 
@@ -77,5 +79,7 @@ __all__ = [
     'create_feature_extraction_udf',
     'create_semantic_match_udf',
     'create_feature_join_udf',
+    'create_feature_join_udf_with_prompt',
+    'create_llm_feature_join_udf',
     'feature_extraction_join',
 ]

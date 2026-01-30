@@ -39,6 +39,8 @@ from util.feature_extraction_join import (
     create_feature_extraction_udf,
     create_semantic_match_udf,
     create_feature_join_udf,
+    create_feature_join_udf_with_prompt,
+    create_llm_feature_join_udf,
     feature_extraction_join,
 )
 
@@ -153,20 +155,40 @@ def demo_sql_join(
     print("Demo: Feature Extraction Join with SQL")
     print("="*70)
 
-    # Register UDFs
-    extract_udf = create_feature_extraction_udf(config)
+    # Register UDFs with different prompt strategies
+    # 1. Basic feature extraction
+    extract_udf = create_feature_extraction_udf(
+        config,
+        extraction_prompt="Describe this product image focusing on type, color, material, and style"
+    )
+
+    # 2. Semantic matching
     match_udf = create_semantic_match_udf(config)
-    join_udf = create_feature_join_udf(config, threshold=0.5)
+
+    # 3. Feature join with fixed prompt (prompt specified at registration)
+    join_udf = create_feature_join_udf(
+        config,
+        prompt="Extract features from {image} and determine if it matches: {text}",
+        threshold=0.5
+    )
+
+    # 4. Feature join with dynamic prompt (prompt as SQL parameter)
+    join_with_prompt_udf = create_feature_join_udf_with_prompt(config, threshold=0.5)
+
+    # 5. Direct VLM join (no feature extraction, direct VLM call per pair)
+    llm_join_udf = create_llm_feature_join_udf(config)
 
     spark.udf.register("EXTRACT_FEATURES", extract_udf)
     spark.udf.register("SEMANTIC_MATCH", match_udf)
     spark.udf.register("FEATURE_JOIN", join_udf)
+    spark.udf.register("FEATURE_JOIN_PROMPT", join_with_prompt_udf)
+    spark.udf.register("LLM_FEATURE_JOIN", llm_join_udf)
 
     # Create temp views
     left_df.createOrReplaceTempView("product_images")
     right_df.createOrReplaceTempView("product_descriptions")
 
-    # Query 1: Extract features and show
+    # Query 1: Extract features with custom prompt
     print("\n--- Query 1: Extract Features from Images ---")
     query1 = """
         SELECT
@@ -178,8 +200,8 @@ def demo_sql_join(
     """
     print(f"SQL:\n{query1}")
 
-    # Query 2: Join with extracted features
-    print("\n--- Query 2: Feature Extraction Join ---")
+    # Query 2: Join with extracted features (two-step approach)
+    print("\n--- Query 2: Two-Step Feature Extraction Join ---")
     query2 = """
         -- Step 1: Extract features from images (with grouping optimization)
         WITH images_with_features AS (
@@ -207,45 +229,90 @@ def demo_sql_join(
     """
     print(f"SQL:\n{query2}")
 
-    # Query 3: Using direct join predicate
-    print("\n--- Query 3: Direct Feature Join Predicate ---")
+    # Query 3: Direct join with fixed prompt (specified at UDF registration)
+    print("\n--- Query 3: Direct Feature Join (Fixed Prompt) ---")
     query3 = """
         -- Direct multimodal join using FEATURE_JOIN UDF
+        -- Prompt was set at registration: "Extract features from {image} and match: {text}"
         SELECT
             l.id as image_id,
             l.category as image_category,
             r.desc_id,
             r.category as desc_category,
             r.text as matched_description
-        FROM product_images l, product_descriptions d
+        FROM product_images l, product_descriptions r
         WHERE FEATURE_JOIN(l.image_path, r.text) = true
-          AND l.category = r.category  -- Optional: additional filter
         ORDER BY l.id
+        LIMIT 20
     """
     print(f"SQL:\n{query3}")
 
-    # Query 4: Aggregation with join
-    print("\n--- Query 4: Aggregation after Join ---")
+    # Query 4: Join with dynamic prompt (prompt as SQL parameter)
+    print("\n--- Query 4: Feature Join with Dynamic Prompt ---")
     query4 = """
-        -- Count matches per category
+        -- Multimodal join with prompt specified in the query
+        -- The prompt includes both {image} and {text} placeholders
+        SELECT
+            l.id as image_id,
+            l.category as image_category,
+            r.desc_id,
+            r.text as matched_description
+        FROM product_images l, product_descriptions r
+        WHERE FEATURE_JOIN_PROMPT(
+            l.image_path,
+            r.text,
+            'Analyze {image} to identify the product type and features, then match with: {text}'
+        ) = true
+        ORDER BY l.id
+        LIMIT 20
+    """
+    print(f"SQL:\n{query4}")
+
+    # Query 5: Direct VLM join (no caching, direct VLM per pair)
+    print("\n--- Query 5: Direct VLM Join with Prompt ---")
+    query5 = """
+        -- Direct VLM call for each image-text pair
+        -- Use this when you need VLM reasoning for each pair
+        -- More expensive but more accurate for nuanced matching
+        SELECT
+            l.id as image_id,
+            r.desc_id,
+            r.text as description,
+            LLM_FEATURE_JOIN(
+                l.image_path,
+                r.text,
+                'Does {image} show the product described as: {text}? Answer Yes or No.'
+            ) as vlm_response
+        FROM product_images l, product_descriptions r
+        WHERE l.category = r.category  -- Pre-filter to reduce VLM calls
+        LIMIT 20
+    """
+    print(f"SQL:\n{query5}")
+
+    # Query 6: Aggregation after join
+    print("\n--- Query 6: Aggregation after Feature Join ---")
+    query6 = """
+        -- Count matches per category using feature join
         WITH joined AS (
             SELECT
+                l.id,
                 l.category,
-                EXTRACT_FEATURES(l.image_path) as features,
                 r.text
-            FROM product_images l
-            CROSS JOIN product_descriptions r
-            WHERE SEMANTIC_MATCH(EXTRACT_FEATURES(l.image_path), r.text) > 0.5
+            FROM product_images l, product_descriptions r
+            WHERE FEATURE_JOIN_PROMPT(
+                l.image_path,
+                r.text,
+                'Extract product features from {image} and check match with: {text}'
+            ) = true
         )
         SELECT
             category,
-            COUNT(*) as num_matches,
-            AVG(length(features)) as avg_feature_length
+            COUNT(*) as num_matches
         FROM joined
         GROUP BY category
         ORDER BY num_matches DESC
     """
-    print(f"SQL:\n{query4}")
+    print(f"SQL:\n{query6}")
 
     return True
 

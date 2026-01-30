@@ -813,8 +813,13 @@ def create_feature_extraction_udf(
     """
     Create a Spark UDF for extracting features from images.
 
+    The prompt can include {image} placeholder which will be replaced during extraction.
+
     Usage:
-        spark.udf.register("EXTRACT_FEATURES", create_feature_extraction_udf(config))
+        spark.udf.register("EXTRACT_FEATURES", create_feature_extraction_udf(
+            config,
+            extraction_prompt="Describe the product in {image} focusing on category, color, and material"
+        ))
         spark.sql("SELECT id, EXTRACT_FEATURES(image) as features FROM images")
     """
     from pyspark.sql.functions import pandas_udf
@@ -874,26 +879,37 @@ def create_semantic_match_udf(
 
 def create_feature_join_udf(
     config: FeatureExtractionConfig = None,
-    join_prompt: str = "Match the image content with the text description",
+    prompt: str = "Extract features from {image} and determine if it matches the description: {text}",
     threshold: float = 0.5
 ):
     """
-    Create a Spark UDF for Feature Extraction Join.
+    Create a Spark UDF for Feature Extraction Join with a prompt that includes both join keys.
 
-    This is a join predicate UDF that returns true if image matches text.
+    The prompt MUST include both {image} and {text} placeholders:
+    - {image}: Placeholder for the image from left table
+    - {text}: Placeholder for the text from right table
+
+    The prompt guides both:
+    1. How to extract features from the image
+    2. How to match with the text description
 
     Usage:
         spark.udf.register("FEATURE_JOIN", create_feature_join_udf(
             config,
-            join_prompt="Match product images with descriptions",
+            prompt="Given {image}, extract product features and check if they match: {text}",
             threshold=0.5
         ))
 
         spark.sql('''
             SELECT l.*, r.*
-            FROM left_table l, right_table r
-            WHERE FEATURE_JOIN(l.image, r.text)
+            FROM products_images l, product_descriptions r
+            WHERE FEATURE_JOIN(l.image, r.description)
         ''')
+
+    Example prompts:
+        - "Extract visual features from {image} and match with product description: {text}"
+        - "Analyze {image} to identify objects and verify against: {text}"
+        - "Does the property shown in {image} match the listing: {text}?"
     """
     from pyspark.sql.functions import pandas_udf
     from pyspark.sql.types import BooleanType
@@ -901,12 +917,22 @@ def create_feature_join_udf(
     config = config or FeatureExtractionConfig()
     fe_join = FeatureExtractionJoin(config)
 
+    # Validate prompt has both placeholders
+    if "{image}" not in prompt or "{text}" not in prompt:
+        raise ValueError("Prompt must include both {image} and {text} placeholders")
+
+    # Parse prompt to separate extraction and matching parts
+    # The part before {text} guides extraction, the full prompt guides matching
+    extraction_prompt = prompt.split("{text}")[0].replace("{image}", "this image").strip()
+    if extraction_prompt.endswith(":"):
+        extraction_prompt = extraction_prompt[:-1]
+
     # Cache for extracted descriptions
     _description_cache = {}
 
     @pandas_udf(BooleanType())
     def feature_join_udf(images: pd.Series, texts: pd.Series) -> pd.Series:
-        """Check if image matches text based on extracted features."""
+        """Check if image matches text based on extracted features and the join prompt."""
         results = []
 
         # Batch extract descriptions for new images
@@ -914,13 +940,13 @@ def create_feature_join_udf(
         new_indices = []
 
         for i, img in enumerate(images):
-            img_key = str(img)[:100] if img else None  # Use partial key for hashing
+            img_key = str(img)[:100] if img else None
             if img_key and img_key not in _description_cache:
                 new_images.append(img)
                 new_indices.append(i)
 
         if new_images:
-            descriptions = fe_join.get_extracted_features(new_images)
+            descriptions = fe_join.get_extracted_features(new_images, extraction_prompt)
             for idx, desc in zip(new_indices, descriptions):
                 img_key = str(images[idx])[:100]
                 _description_cache[img_key] = desc
@@ -949,6 +975,181 @@ def create_feature_join_udf(
         return pd.Series(results)
 
     return feature_join_udf
+
+
+def create_feature_join_udf_with_prompt(
+    config: FeatureExtractionConfig = None,
+    threshold: float = 0.5
+):
+    """
+    Create a Spark UDF for Feature Extraction Join where the prompt is passed as a SQL parameter.
+
+    This allows the prompt to be specified at query time rather than at UDF registration.
+    The prompt MUST include both {image} and {text} placeholders.
+
+    Usage:
+        spark.udf.register("FEATURE_JOIN_PROMPT", create_feature_join_udf_with_prompt(config))
+
+        spark.sql('''
+            SELECT l.*, r.*
+            FROM products_images l, product_descriptions r
+            WHERE FEATURE_JOIN_PROMPT(
+                l.image,
+                r.description,
+                'Extract features from {image} and match with: {text}'
+            )
+        ''')
+
+    SQL Signature:
+        FEATURE_JOIN_PROMPT(image_col, text_col, prompt_string) -> boolean
+    """
+    from pyspark.sql.functions import pandas_udf
+    from pyspark.sql.types import BooleanType
+
+    config = config or FeatureExtractionConfig()
+
+    # Global cache shared across batches
+    _description_cache = {}
+    _prompt_cache = {}  # Cache extraction prompts derived from join prompts
+
+    @pandas_udf(BooleanType())
+    def feature_join_with_prompt_udf(
+        images: pd.Series,
+        texts: pd.Series,
+        prompts: pd.Series
+    ) -> pd.Series:
+        """
+        Feature join with prompt as parameter.
+
+        Args:
+            images: Image data (bytes or paths)
+            texts: Text descriptions to match
+            prompts: Join prompt with {image} and {text} placeholders
+        """
+        results = []
+
+        # Get unique prompts in this batch (usually just one)
+        unique_prompts = prompts.unique()
+
+        for join_prompt in unique_prompts:
+            if not join_prompt or "{image}" not in join_prompt or "{text}" not in join_prompt:
+                continue
+
+            # Derive extraction prompt from join prompt
+            if join_prompt not in _prompt_cache:
+                extraction_prompt = join_prompt.split("{text}")[0].replace("{image}", "this image").strip()
+                if extraction_prompt.endswith(":"):
+                    extraction_prompt = extraction_prompt[:-1]
+                _prompt_cache[join_prompt] = extraction_prompt
+
+        # Process each row
+        fe_join = FeatureExtractionJoin(config)
+        matcher = TextMatcher(config)
+
+        for img, txt, prompt_str in zip(images, texts, prompts):
+            if not img or not txt or not prompt_str:
+                results.append(False)
+                continue
+
+            if "{image}" not in prompt_str or "{text}" not in prompt_str:
+                results.append(False)
+                continue
+
+            # Get or compute description
+            cache_key = (str(img)[:100], prompt_str)
+
+            if cache_key not in _description_cache:
+                extraction_prompt = _prompt_cache.get(prompt_str, "Describe this image")
+                descriptions = fe_join.get_extracted_features([img], extraction_prompt)
+                _description_cache[cache_key] = descriptions[0] if descriptions else ""
+
+            description = _description_cache[cache_key]
+
+            if not description:
+                results.append(False)
+                continue
+
+            # Compute similarity
+            sim_matrix = matcher.compute_similarity_matrix([description], [txt])
+            similarity = float(sim_matrix[0, 0])
+
+            results.append(similarity >= threshold)
+
+        return pd.Series(results)
+
+    return feature_join_with_prompt_udf
+
+
+def create_llm_feature_join_udf(
+    config: FeatureExtractionConfig = None
+):
+    """
+    Create a Spark UDF that uses VLM for direct image-text matching with a custom prompt.
+
+    This UDF sends both the image and text to the VLM in a single call,
+    using the prompt to guide the matching decision.
+
+    The prompt should include:
+    - {image}: Placeholder for the image
+    - {text}: Placeholder for the text to match
+
+    Usage:
+        spark.udf.register("LLM_FEATURE_JOIN", create_llm_feature_join_udf(config))
+
+        spark.sql('''
+            SELECT l.*, r.*
+            FROM products_images l, product_descriptions r
+            WHERE LLM_FEATURE_JOIN(
+                l.image,
+                r.description,
+                'Does {image} show the product described as: {text}? Answer Yes or No.'
+            ) = 'Yes'
+        ''')
+
+    SQL Signature:
+        LLM_FEATURE_JOIN(image_col, text_col, prompt_string) -> string (VLM response)
+    """
+    from pyspark.sql.functions import pandas_udf
+    from pyspark.sql.types import StringType
+
+    config = config or FeatureExtractionConfig()
+    extractor = FeatureExtractor(config)
+
+    @pandas_udf(StringType())
+    def llm_feature_join_udf(
+        images: pd.Series,
+        texts: pd.Series,
+        prompts: pd.Series
+    ) -> pd.Series:
+        """
+        Direct VLM-based image-text matching.
+
+        The VLM receives both the image and the text, guided by the prompt.
+        """
+        results = []
+
+        for img, txt, prompt_str in zip(images, texts, prompts):
+            if not img or not txt or not prompt_str:
+                results.append("")
+                continue
+
+            # Build the actual prompt by replacing placeholders
+            actual_prompt = prompt_str.replace("{text}", str(txt))
+            # {image} is handled by sending the image to VLM
+
+            # Remove {image} placeholder from text prompt (image is sent separately)
+            actual_prompt = actual_prompt.replace("{image}", "the image")
+
+            try:
+                response = extractor.extract_description(img, actual_prompt)
+                results.append(response)
+            except Exception as e:
+                print(f"VLM error: {e}")
+                results.append("")
+
+        return pd.Series(results)
+
+    return llm_feature_join_udf
 
 
 # ============================================================================
