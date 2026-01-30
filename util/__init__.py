@@ -6,6 +6,7 @@ This package contains utility modules for multimodal LLM processing with Spark S
 Modules:
 - hvfp_join: Hierarchical Visual-Feature Proxy Join (three-phase cascade)
 - feature_extraction_join: Feature Extraction Join (image grouping + text-text join)
+- indexed_feature_join: Vector-Indexed Join with O(N*log(M)) complexity
 """
 
 from util.hvfp_join import (
@@ -40,6 +41,18 @@ from util.feature_extraction_join import (
     create_feature_join_udf_with_prompt,
     create_llm_feature_join_udf,
     feature_extraction_join,
+)
+
+from util.indexed_feature_join import (
+    IndexedFeatureExtractionJoin,
+    IndexedJoinConfig,
+    IndexedJoinResult,
+    IndexedJoinStats,
+    UnifiedEmbedder,
+    VectorIndex,
+    VLMVerifier,
+    create_indexed_feature_join_udf,
+    create_indexed_feature_join_predicate_udf,
 )
 
 __all__ = [
@@ -82,4 +95,15 @@ __all__ = [
     'create_feature_join_udf_with_prompt',
     'create_llm_feature_join_udf',
     'feature_extraction_join',
+
+    # Indexed Feature Join (O(N*log(M)) complexity)
+    'IndexedFeatureExtractionJoin',
+    'IndexedJoinConfig',
+    'IndexedJoinResult',
+    'IndexedJoinStats',
+    'UnifiedEmbedder',
+    'VectorIndex',
+    'VLMVerifier',
+    'create_indexed_feature_join_udf',
+    'create_indexed_feature_join_predicate_udf',
 ]
